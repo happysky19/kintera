@@ -41,3 +41,44 @@ sections:
     - symbols, reserved letters
   sec-appa-index:
     - notation index: [symbol table]
+
+  # Chapter 3. Equation of state and thermodynamic functions
+  sec-ch03-species-state:
+    - species order, gases then condensates
+    - state vectors, mole fractions and mass fractions: [ThermoX, ThermoY, Y->X, X->Y]
+    - conversions between mass and mole fractions
+  sec-ch03-eos:
+    - equation of state, ideal gas: [VT->P, PV->T, TPX->V]
+    - compressibility factor: [czh]
+    - pressure from density and temperature
+    - temperature from pressure and density
+  sec-ch03-caloric:
+    - heat capacity, constant: [cv_R]
+    - heat capacity, NASA-9 polynomial: [use-nasa9-cp]
+    - heat capacity, hydrogen rotational: [use-h2-cp, h2-cp-mode, ortho-para]
+    - internal energy of a species
+    - temperature from internal energy: [VU->T]
+    - enthalpy of a species
+  sec-ch03-reference-state:
+    - reference state: [Tref, Pref, u0_R, s0_R]
+    - latent heat, from the energy offsets
+    - Kirchhoff relation, latent heat and heat capacities
+  sec-ch03-entropy:
+    - entropy of a gas
+    - entropy of a condensate, derived from the saturation curve
+    - Gibbs free energy: [THS->G]
+    - Helmholtz free energy: [TUS->F]
+    - temperature from entropy and pressure: [PXS->T]
+  sec-ch03-relative-humidity:
+    - relative humidity: [saturation ratio, relative_humidity]
+    - saturation ratio, with gaseous products: [ngas]
+  sec-ch03-adiabat:
+    - moist adiabat: [extrapolate_dlnp, extrapolate_dz]
+    - effective heat capacity, with the latent term: [effective_cp]
+    - pseudo-adiabat, rain-out: [rainout]
+
+unlabeled:
+  # the per-chapter fragments of Appendix B carry the chapter title as an unlabelled `##` heading (gen_derivation_index.py)
+  - file: chapters/appendices/_appb-ch03.qmd
+    heading: Equation of state and thermodynamic functions (@sec-ch03)
+    covered-by: sec-appb
