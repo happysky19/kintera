@@ -1,0 +1,6 @@
+[C1] PASS dr/dxi - sum_i (a_i/x_i - A/x_g) nu_i = 0
+[C2] PASS condensation: |r| per iteration 2.31e+00, 1.67e+00, 1.00e+00, 3.23e-01, 6.90e-02, 2.32e-03, 2.74e-06, 3.84e-12; max |r_k+1|/r_k^2 = 0.66; x_v/x_g - p_sat/p relative error 3.8e-12; cloud x_c = 0.090981
+[C3] PASS evaporation: r_0 = -3.516, first extent -0.00352 (cloud stock 0.02); vapour growth per pass 4.66, 3.02, 1.54; limiter factors 1.000, 1.000, 0.579, 1.000; final x_c = 0.0, r = -0.493, iterations 4, status 0
+[C4] PASS sum x after the step = 1.000030; ratios to He unchanged by renormalisation (max relative change 2.2e-16)
+[C5] PASS diag: converged in 3 -> 3; not converged after 10 -> -2010; KKT error 4 after 3 -> -403
+equilibrate_tp_check: 5 of 5 passed

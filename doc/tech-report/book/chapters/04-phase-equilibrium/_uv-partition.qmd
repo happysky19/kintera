@@ -1,0 +1,191 @@
+## The partition solver for disjoint vapour-cloud pairs (`uv-solver: partition`) {#sec-ch04-uv-partition}
+
+<!-- PROVENANCE
+pin: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45 (main)
+sources: src/thermo/equilibrate_uv.h, src/thermo/thermo_y.cpp, docs/source/equilibrate_uv_partition.rst, tests/test_thermo.cpp, tests/test_inline_svp.py, tests/test_cuda_workspace.py, tests/test_reaction_equilibrium.py
+status: draft
+author: Tianhao Le (happysky19)
+reviewer: Xinyue (requested)
+-->
+
+### Summary
+
+When every reaction of the card turns one vapour into one condensate and no species takes part in two reactions,
+the fixed-energy problem of @sec-ch04-equilibrate-uv has a much simpler structure: at any trial temperature each
+pair's split between vapour and cloud is known in closed form (all of the inventory as vapour if that is below
+saturation, the saturated amount otherwise), so the only unknown is the temperature, fixed by the energy. This
+solver exploits that: it brackets the root of the energy residual in temperature by halving or doubling, then takes
+safeguarded Newton steps inside the bracket. It is the default first attempt (`uv-solver: auto`) for such cards, the
+Uranus-like methane and hydrogen-sulfide cards among them, and it falls back to the constrained-least-squares
+kernel when it cannot bracket or converge.
+
+::: {.callout-note title="At a glance"}
+**Purpose.** Solve the fixed-energy problem for disjoint pairs through the scalar equation @eq-ch04-uv-partition-energy
+with the closed-form split @eq-ch04-uv-partition-split.
+
+**Data.** Same as @sec-ch04-equilibrate-uv; the gain returned is zero (no active block), `diag` the iteration count
+or $-1$ on a forced-partition failure.
+
+**Placement.** Inside `equilibrate_uv`, before its own iteration, when the solver code is `auto` or `partition`.
+
+**Activation.** `uv-solver: partition` (forced; a non-partitionable network is refused at the call) or `auto`
+(default; falls back). Eligibility is decided once in `reset` from the stoichiometric matrix.
+
+**Guarantee / limits.** Energy closed to $64\,\epsilon_{\mathrm{mach}}\max(|U_0|, 1)$; inventories exact; the slope used
+in the Newton step is the exact derivative only when the extra caloric functions do not depend on concentration.
+
+**Evidence.** The Tests layer below: the three solver settings agree on recorded states; inline and named curves
+agree bit for bit under this solver; CUDA equals CPU.
+:::
+
+Local symbols: for pair $j$ with reaction $a_j V_j \to b_j C_j$, $N_j = c_{V_j} + (a_j/b_j)\,c_{C_j}$ the
+reaction-invariant inventory [$\mathrm{mol\,m^{-3}}$] (`totals`); $c^{\mathrm{sat}}_{V_j}(T)$ the saturated vapour
+concentration; $F(T) = U(T) - U_0$ the energy residual [$\mathrm{J\,m^{-3}}$]; $F'_{\mathrm{used}}$ the slope the solver
+uses; $[T_{\mathrm{lo}}, T_{\mathrm{hi}}]$ the bracket. The internal names are `partition_uv_state` (the split and
+its energy at one temperature) and `equilibrate_uv_partition` (the scalar solve).
+
+### Derivation
+
+**The split.** For pair $j$ the saturation condition $a_j\ln(c_{V_j}\mathcal R T) = L_j(T)$ gives the saturated
+vapour concentration, and the inventory $N_j$ is what the reaction cannot change:
+$$
+c^{\mathrm{sat}}_{V_j}(T) = \frac{\exp\bigl(L_j(T)/a_j\bigr)}{\mathcal R T}, \qquad
+c_{V_j}(T) = \min\bigl(N_j, c^{\mathrm{sat}}_{V_j}(T)\bigr), \qquad
+c_{C_j}(T) = \frac{b_j}{a_j}\bigl(N_j - c_{V_j}(T)\bigr) ,
+$$ {#eq-ch04-uv-partition-split}
+which is the complementarity condition of @sec-ch04-conditions solved explicitly: either the whole inventory is
+vapour and undersaturated, or the vapour is saturated and the rest is cloud. A pair with $N_j = 0$ has both set to
+zero. @eq-ch04-uv-partition-split is computed in `partition_uv_state`
+({{< code src/thermo/equilibrate_uv.h partition_uv_state >}}); species that belong to no pair keep their
+concentrations. The energy of the split state and its temperature derivative are
+$$
+\begin{aligned}
+F(T) &= \sum_i c_i(T)\,u_i(T) - U_0, \\
+F'_{\mathrm{used}}(T) &= \sum_i c_i(T)\,u_i'(T) + \sum_{j:\,c_{V_j} < N_j}
+\frac{\mathrm dc_{V_j}}{\mathrm dT}\Bigl(u_{V_j} - \frac{b_j}{a_j}u_{C_j}\Bigr), \qquad
+\frac{\mathrm dc_{V_j}}{\mathrm dT} = c_{V_j}\Bigl(\frac{L'_j}{a_j} - \frac1T\Bigr),
+\end{aligned}
+$$ {#eq-ch04-uv-partition-energy}
+where the second sum is the latent contribution of every pair that is on its saturation curve (a pair that is all
+vapour has a constant $c_{V_j}$ and contributes nothing) and the derivative of the saturated concentration is
+`[C1]` of `uv_partition_check.py`. @eq-ch04-uv-partition-energy is computed in the same `partition_uv_state`. The
+slope is the exact $\mathrm dF/\mathrm dT$ when the extra caloric functions of @sec-ch03-caloric are
+thermodynamically consistent and independent of concentration, which is the case for the baseline (none at the
+pin); otherwise it is the slope the implementation uses, as the in-tree note says.
+
+**The scalar solve.** Starting from the driver's temperature, `equilibrate_uv_partition`
+({{< code src/thermo/equilibrate_uv.h equilibrate_uv_partition >}}) evaluates $F$; if $\lvert F\rvert$ exceeds the tolerance
+$64\,\epsilon_{\mathrm{mach}}\max(|U_0|, 1)$ it brackets a sign change by halving the temperature while $F > 0$ or
+doubling it while $F < 0$ (at most 64 steps), then iterates
+$$
+T \leftarrow T - \frac{F(T)}{F'_{\mathrm{used}}(T)}, \quad \text{replaced by } \tfrac12(T_{\mathrm{lo}} + T_{\mathrm{hi}})
+\text{ when the step is not finite or leaves the bracket},
+$$ {#eq-ch04-uv-partition-newton}
+updating the bracket from the sign of $F$ after each step, until $\lvert F\rvert$ is within tolerance or `max-iter` is
+reached (the initial evaluation counts as the first iteration). @eq-ch04-uv-partition-newton is computed in
+`equilibrate_uv_partition`. On success the gain is zero, `nactive` is zero and `diag` is the iteration count; on
+failure the pre-partition state is restored and the caller decides: `auto` runs the constrained-least-squares
+kernel, `partition` returns status 2 with a printed warning and `diag` $= -1$.
+
+The inventories are exact by construction (`[C3]`), and the energy is closed to the stated tolerance
+($1.2\times10^{-10}\,\mathrm{J\,m^{-3}}$ against $2.4\times10^{-10}$ on the water example). On the same state the
+partition solver and the constrained-least-squares branch agree in temperature and cloud amount to $10^{-7}$
+relative (`[C2]`: $314.1149\,\mathrm K$ from both), the difference being their different stopping rules. The
+eligibility rule (`[C4]`) is evaluated once per module: the Jupiter card is not partitionable (ammonia in two
+reactions), the methane and hydrogen-sulfide card is, a reaction with a gaseous product is not. The check is
+`uv_partition_check.py`, a numpy port of both functions that reuses the state of `equilibrate_uv_check.py`.
+
+### Numerical method
+
+@fig-ch04-uv-partition-energy shows $F(T)$ for the water example: a straight line where the pair is all vapour
+(constant heat capacity, no latent term), a steeper curve where the pair is saturated, and the iterates of the
+bracket-and-Newton search. The kink at the temperature where the inventory just fits is where $F'$ jumps; the
+safeguard keeps the Newton step inside the bracket across it. Per cell the work is one evaluation of every curve
+per iteration and no linear algebra, which is why this branch is tried first. The function is evaluated with the
+same per-cell arena as the main kernel and runs under the same dispatch.
+
+```{python}
+#| label: fig-ch04-uv-partition-energy
+#| fig-cap: "The energy residual of the partitioned state against trial temperature for the water example of the fixed-energy check (blue), with the kink where the whole inventory fits in the vapour, and the iterates of the partition solver (green circles; the first three are numbered from the start, and iterates 3 to 6 share one label where they sit on the solution; the dotted grey line is the solution). Above the kink the pair is all vapour and the residual is linear in temperature; below it the pair is saturated and the latent term steepens the curve."
+#| fig-alt: "A curve of energy residual in kilojoules per cubic metre against temperature from 260 to 320 K, crossing zero near 314 K, with a visible change of slope near 318 K. Numbered circles mark the first three iterates and one label marks the cluster at the zero crossing."
+#| echo: false
+from kintera_report.ch04.figures.fig_uv_partition_energy import make_fig
+make_fig()
+```
+
+Eligibility is computed in `ThermoYImpl::reset` ({{< code src/thermo/thermo_y.cpp ThermoYImpl::reset >}}): for each
+reaction, exactly one gas with a negative coefficient and exactly one condensate with a positive one, every
+coefficient finite, and no species used twice; the result is the member `uv_partitionable`
+({{< code src/thermo/thermo.hpp ThermoYImpl::uv_partitionable >}}). The two coefficients $a_j$ and $b_j$ may differ
+from one.
+
+### Code
+
+| what | code link | symbol | switch |
+|---|---|---|---|
+| the split and its energy, @eq-ch04-uv-partition-split, @eq-ch04-uv-partition-energy | {{< code src/thermo/equilibrate_uv.h partition_uv_state >}} | `partition_uv_state` | `uv-solver` |
+| bracket and Newton, @eq-ch04-uv-partition-newton | {{< code src/thermo/equilibrate_uv.h equilibrate_uv_partition >}} | `equilibrate_uv_partition` | `uv-solver` |
+| the call and the fallback | {{< code src/thermo/equilibrate_uv.h equilibrate_uv >}} | `equilibrate_uv` | `auto`, `partition` |
+| eligibility | {{< code src/thermo/thermo_y.cpp ThermoYImpl::reset >}} | `ThermoYImpl::reset` | always |
+| the flag | {{< code src/thermo/thermo.hpp ThermoYImpl::uv_partitionable >}} | `ThermoYImpl::uv_partitionable` | always |
+| refusal of a forced partition | {{< code src/thermo/thermo_y.cpp ThermoYImpl::forward >}} | `ThermoYImpl::forward` | `partition` |
+| depleted-cloud predicate | {{< code src/thermo/equilibrate_uv.h is_depleted_cloud >}} | `is_depleted_cloud` | always |
+
+: Code map of the partition solver. {#tbl-ch04-uv-partition-code}
+
+Walk-through:
+
+1. `forward` maps the option to the solver code and throws `UV partition solver requires disjoint vapor-cloud
+   reactions` when `partition` is forced on an ineligible network; `auto` on an ineligible network silently uses the
+   main kernel.
+2. `equilibrate_uv` calls `equilibrate_uv_partition` first for codes `auto` and `partition`; a return of 0 ends the
+   call; otherwise `partition` returns 2 with `[Warning] equilibrate_uv partition did not converge`, and `auto`
+   continues into the constrained-least-squares iteration.
+3. Inside: inventories from the clamped input, validity (finite, non-negative), the first evaluation, the bracket,
+   the Newton loop, and on failure the restoration of the input state with `diag` $= -1$.
+
+### Tests
+
+| test (ctest name) | what it asserts | tolerance | where the tolerance comes from |
+|---|---|---|---|
+| `tests/test_thermo.cpp` (`test_thermo`), `DeviceTest.equilibrate_uv_depleted_cloud` | with `partition` forced: a cold state converges, the inventory is exact, energy closed, the final vapour is saturated; `max-iter` 1 fails with `diag` $-1$, zero gain and the input restored; `auto` and `kkt` give the same state | $10^{-6}\,\mathrm K$; $10^{-12}$ relative; $10^{-6}$ in $\ln c$ | set in the test; round-off; the energy stop |
+| `tests/test_thermo.cpp` (`test_thermo`), `DeviceTest.equilibrate_uv_partition_rejects_coupled_reactions` | `partition` on the Jupiter card throws | exception | exact |
+| `tests/test_inline_svp.py` (`test_inline_svp.py`), `test_ideal_equilibrate_uv_bitwise` (`partition`) | inline and named curves give bit-identical mass fractions through this solver | exact | bit comparison |
+| `tests/test_cuda_workspace.py` (`test_cuda_workspace.py`), `test_equilibrate_uv_cuda_matches_cpu` (`partition`) | eight pairs: CUDA equals CPU | rtol $10^{-10}$, atol $10^{-14}$ | same algorithm |
+| `tests/test_reaction_equilibrium.py` (`test_reaction_equilibrium.py`), `test_gas_product_rejects_partition` | a reaction with a gaseous product refuses the forced partition | exception text | exact |
+| `src/kintera_report/ch04/checks/uv_partition_check.py` | the derivative of the saturated concentration; agreement with the constrained-least-squares branch; inventory and energy at convergence; eligibility | symbolic; $10^{-7}$; $64\,\epsilon$ | algebra; the two stopping rules |
+
+: Tests of the partition solver. {#tbl-ch04-uv-partition-tests}
+
+The C++ cases passed on CPU and CUDA in double in the recorded CUDA-build run (the depleted-cloud case skips
+float),[^ch04-uv-partition-run] and the Python files passed in the recorded CPU and CUDA
+runs.[^ch04-uv-partition-cuda] [^ch04-uv-partition-cpu] No test exercises a pair with $a_j \ne b_j$.
+
+[^ch04-uv-partition-run]: [sha: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45; deck: `tests/jupiter.yaml` and
+    the card the depleted-cloud case embeds; run: `ctest -R 'test_thermo|test_equilibrate_tp_max_iter' -V` in the
+    `tests/` directory of a CUDA build (`cmake -DCUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120`), CPU and CUDA (one RTX
+    5090), float and double; `test_thermo` 66 passed, 8 skipped; gcc 11.5.0, CUDA 12.9, cmake 3.31.8, libtorch of
+    torch 2.10.0+cu128]
+
+[^ch04-uv-partition-cuda]: [sha: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45; deck: the cards each test
+    writes; run: `PYTHONPATH=<install-dir> pytest tests/test_cuda_workspace.py tests/test_reaction_equilibrium.py tests/test_warm_start_shape.py tests/test_thermo_x_warm_start_shape.py tests/test_saturation_failure_reported.py`,
+    CPU and CUDA (one RTX 5090), float and double; 135 passed; Python 3.11.13, torch 2.10.0+cu128, numpy 2.4.6]
+
+[^ch04-uv-partition-cpu]: [sha: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45; deck: the cards each test
+    writes; run: `PYTHONPATH=<install-dir> pytest tests/test_equilibrium.py tests/test_nasa9_cp.py tests/test_h2_cp.py tests/test_inline_svp.py tests/test_equilibrate_uv_gain.py tests/test_latent_heat_sign.py tests/test_saturation_adjustment_nh4sh.py tests/test_saturation_degenerate_bound.py tests/test_effective_cp_heap_state.py tests/test_earth.py tests/test_reference_state_keys.py`,
+    CPU, double; 47 passed; Python 3.11.13, torch 2.10.0+cu128, numpy 2.4.6]
+
+### Limits
+
+::: {.callout-warning title="Limits"}
+- Disjoint one-to-one pairs only; shared vapours, gaseous products and multi-gas reactions go to the main kernel
+  (`auto`) or are refused (`partition`).
+- The gain returned is zero, so `effective_cp` of @sec-ch03-adiabat has no latent term from a partition solve;
+  that routine uses `ThermoX`, which never takes this path, but a host that reads `ThermoY`'s gain after a
+  partition solve gets no latent information.
+- The `ftol` option does not apply: the stop is the energy tolerance $64\,\epsilon_{\mathrm{mach}}\max(|U_0|, 1)$, and
+  `max-iter` counts the initial evaluation.
+- The bracket search halves or doubles the temperature up to 64 times; a card whose curves are not monotone in
+  $F$ may bracket a wrong root. Not measured.
+- A pair with $a_j \ne b_j$ is handled by the formulas but untested at the pin.
+:::

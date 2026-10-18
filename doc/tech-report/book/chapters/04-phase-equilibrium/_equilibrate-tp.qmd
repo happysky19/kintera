@@ -1,0 +1,234 @@
+## Saturation adjustment at fixed temperature and pressure (`ThermoX.forward`) {#sec-ch04-equilibrate-tp}
+
+<!-- PROVENANCE
+pin: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45 (main)
+sources: src/thermo/equilibrate_tp.h, src/thermo/thermo_x.cpp, src/thermo/thermo_dispatch.cpp, src/math/leastsq_kkt.h, docs/source/equilibrium_algorithms.rst, tests/test_thermo.cpp, tests/test_equilibrate_tp_max_iter.cpp, tests/test_saturation_adjustment_nh4sh.py, tests/test_inline_svp.py, tests/test_cuda_workspace.py
+status: draft
+author: Tianhao Le (happysky19)
+reviewer: Xinyue (requested)
+-->
+
+### Summary
+
+Given a temperature, a pressure and the mole fractions of all species, this solver moves material between gases
+and condensates until every reaction of @sec-ch04-conditions satisfies its two-sided condition. It is the
+equilibrium step a host code takes when it knows $T$ and $p$ (a prescribed sounding, the trial temperatures of an
+adiabat, the output of a dynamical step that updates pressure and temperature first), and it is called inside every
+pass of the entropy and adiabat routines of @sec-ch03. The method is a Newton iteration on the reaction extents
+in which each step is a small constrained least-squares problem: the linearised residuals of the active reactions
+are driven to zero subject to no species going negative, a per-reaction clip to the stock a step consumes, and a
+line search that keeps every gas positive. Convergence is quadratic once the active set is right, and the solver
+returns the Jacobian of the residuals with respect to the extents, the gain matrix, which @sec-ch03-adiabat needs.
+
+::: {.callout-note title="At a glance"}
+**Purpose.** Solve @eq-ch04-conditions-complementarity at fixed $(T, p)$ by the Newton step @eq-ch04-equilibrate-tp-newton
+on the extents of the active reactions.
+
+**Data.** In: $T$ [K], $p$ [Pa], $x_i$ of all species (last axis), in place; out: adjusted $x_i$, the gain matrix
+$\mathsf G$ $(\dots, N_{\mathrm r}, N_{\mathrm r})$ [-], the diagnostic `diag` $(\dots, 1)$.
+
+**Placement.** `ThermoX.forward`, one call per set of cells; the per-cell kernel is `equilibrate_tp`.
+
+**Activation.** Whenever the card has nucleation reactions (no reactions: a no-op returning an empty tensor).
+`max-iter` (default 10) bounds the outer passes, `ftol` (default $10^{-6}$) is the tolerance on $r_j$; `warm_start`
+reuses the last active set (@sec-ch04-drivers).
+
+**Guarantee / limits.** Mole fractions stay non-negative and sum to one; a converged cell has $|r_j| \le$ `ftol` for
+every active reaction and the complementarity of the rest; a cell that does not converge is returned partially
+adjusted with `diag` $< 0$.
+
+**Evidence.** The Tests layer below: 2000 random Jupiter-like cells, CPU equals CUDA to $10^{-10}$ with eight
+condensables, convergence on the last allowed iteration.
+:::
+
+Local symbols: $\xi_j$ the extent of reaction $j$ per mole of parcel [-]; $\boldsymbol\xi$ the vector over the active
+reactions; $\mathsf W$ the weight matrix, $W_{ji} = \partial r_j/\partial x_i$; $\mathsf G = \mathsf W\mathsf N$ the
+gain matrix with $\mathsf N$ the stoichiometric matrix restricted to the active reactions, $G_{jk} = \partial r_j/\partial\xi_k$;
+$\theta_i$ the per-species stock factor and $\lambda$ the line-search factor [-]; $K_{\max}$ the outer iteration
+cap (`max-iter`). The internal names are `weight`, `gain`, `rhs` (the right-hand side, overwritten by the solved
+extents), `theta`, `lambda`, `reaction_set` and `nactive`.
+
+### Derivation
+
+**The linear system.** Along the reaction extents the mole fractions change by $\mathrm dx_i = \sum_k \nu_{ik}\,\mathrm d\xi_k$
+(before renormalisation), so the residual @eq-ch04-conditions-residual-x of reaction $j$ changes by
+$\mathrm dr_j = \sum_i W_{ji}\,\mathrm dx_i = \sum_k G_{jk}\,\mathrm d\xi_k$ with
+$$
+W_{ji} = \frac{\partial r_j}{\partial x_i} = \frac{a_{ij}}{x_i} - \frac{A_j}{x_{\mathrm g}} \quad (i < N_{\mathrm g}), \qquad
+W_{ji} = 0 \quad (i \ge N_{\mathrm g}), \qquad
+G_{jk} = \sum_{i} W_{ji}\,\nu_{ik} .
+$$ {#eq-ch04-equilibrate-tp-weight}
+The $-A_j/x_{\mathrm g}$ term is the derivative of the gas normalisation: every gas, including an inert one with
+$a_{ij} = 0$, dilutes the partial pressures. @eq-ch04-equilibrate-tp-weight is computed in `equilibrate_tp`
+({{< code src/thermo/equilibrate_tp.h equilibrate_tp >}}) as the array `weight` and the product `mmdot(gain, weight,
+stoich_active)`; for an absent gas reactant the $1/x_i$ is replaced by the bounded $1/r^\star$ of
+@sec-ch04-conditions. The Newton step for the active reactions is then the square linear system
+$$
+\mathsf G\,\Delta\boldsymbol\xi = -\mathbf r ,
+$$ {#eq-ch04-equilibrate-tp-newton}
+which `equilibrate_tp` solves not directly but as the constrained least-squares problem below; for one active
+reaction the gain is the scalar $G = \sum_i (a_i/x_i - A/x_{\mathrm g})\nu_i$ and the step is $-r/G$ (`[C1]` of
+`equilibrate_tp_check.py`, which verifies the derivative symbolically).
+
+**The constraints.** A step must not drive any species negative: $x_i + \sum_k \nu_{ik}\Delta\xi_k \ge 0$. The
+kernel hands @eq-ch04-equilibrate-tp-newton with these $N$ inequality rows to `leastsq_kkt_feasible_origin`
+({{< code src/math/leastsq_kkt.h leastsq_kkt_feasible_origin >}}), the active-set solver of @sec-ch10 for
+$\min\|\mathsf G\Delta\boldsymbol\xi + \mathbf r\|_2$ subject to $-\mathsf N\Delta\boldsymbol\xi \le \mathbf x$: the
+origin $\Delta\boldsymbol\xi = 0$ is feasible by construction (the bounds are the current amounts), the solver adds
+the single most violated bound that is linearly independent of the already active ones per inner iteration, and
+holds an active single-species bound exactly on its value (so that a species that must be used up is used up to
+the last bit, not to within round-off). The inner iteration budget is $\max(N + 1, K_{\max})$, independent of the
+outer one. The method is the active-set strategy for inequality-constrained least squares of Nocedal and Wright
+([Numerical Optimization, 2nd ed., 2006](https://doi.org/10.1007/978-0-387-40065-5), chapter 16) in the
+non-negative least-squares tradition of Lawson and Hanson
+([Solving Least Squares Problems, 1995](https://doi.org/10.1137/1.9781611971217), chapter 23); the KKT system itself,
+its scaling and its direct solve are the subject of @sec-ch10.
+
+**Limiter and line search.** The solver does not enforce a bound that is linearly dependent on the active block
+(two condensates drawing on one vapour), so the kernel clips every reaction to the stock of what it consumes:
+$$
+\theta_i = \min\Bigl(1, \frac{x_i}{\sum_k \max(0, -\nu_{ik}\Delta\xi_k)}\Bigr), \qquad
+\Delta\xi_k \leftarrow \Delta\xi_k \min_{i:\,\nu_{ik}\Delta\xi_k < 0} \theta_i ,
+$$ {#eq-ch04-equilibrate-tp-limiter}
+with no credit for what another reaction produces at the same time. @eq-ch04-equilibrate-tp-limiter is computed in
+`equilibrate_tp` ({{< code src/thermo/equilibrate_tp.h equilibrate_tp >}}) as the arrays `theta` and the per-reaction
+`lam`. The update is then applied with a factor $\lambda$ that is halved until every gas stays strictly positive
+(a gas that was positive may not land exactly on zero), after which the mole fractions are renormalised to sum to
+one, which matters whenever $\sum_i \nu_{ij} \ne 0$ and leaves every mole ratio unchanged (`[C4]`):
+$$
+x_i \leftarrow \frac{x_i + \lambda\sum_k \nu_{ik}\Delta\xi_k}{\sum_l \bigl(x_l + \lambda\sum_k \nu_{lk}\Delta\xi_k\bigr)} .
+$$ {#eq-ch04-equilibrate-tp-update}
+@eq-ch04-equilibrate-tp-update is computed in the same `equilibrate_tp`. A $\lambda$ that underflows is a failure
+(status 4).
+
+**What the iteration returns.** On exit, with the final composition, the active set is recomputed with the
+equilibrium test $|r_j| \le \varepsilon_{\mathrm{tol}}$ and the gain of exactly those reactions is assembled and
+scattered into the $N_{\mathrm r} \times N_{\mathrm r}$ output, zero outside the active block; this $\mathsf G$ is what
+`effective_cp` of @sec-ch03-adiabat inverts. The diagnostic is the iteration count on success and
+$-(100\,s + n)$ on failure, with status $s = 20$ for the iteration cap and $s \in \{1, 2, 3\}$ for the solver's own
+codes or $4$ for the line search (`[C5]`); convergence on the last allowed pass counts as success. What is exact:
+the renormalised update conserves every mole ratio and the complementarity at convergence holds to
+$\varepsilon_{\mathrm{tol}}$ in the log quotient. What is approximate: the linearisation; the iteration is Newton's
+method with quadratic convergence near the solution (`[C2]`: the ratio $|r_{k+1}|/r_k^2$ stays below one on the
+water example) and a damped first phase while far from it, because the step on the logarithmic residual changes a
+small vapour fraction by at most a factor of about $1 + |r|$ per pass (`[C3]`). The check is
+`equilibrate_tp_check.py`, a numpy port of the kernel for one reaction.
+
+### Numerical method
+
+One outer pass, for one cell, in the order the kernel runs it:
+
+1. Compute the shifted curves $L_j - A_j\ln p$ once per call ({{< code src/thermo/equilibrate_tp.h equilibrate_tp >}}).
+2. For every reaction in the current `reaction_set`, evaluate $r_j$; put the reaction in the active block if the
+   test of @sec-ch04-conditions says so, otherwise swap it to the back of the set. The active block is the first
+   `nactive` entries.
+3. If the block is empty, stop: converged (also when this happens on the last allowed pass).
+4. Assemble $\mathsf W$ for the block and $\mathsf G = \mathsf W\mathsf N$; solve the constrained least-squares problem
+   for $\Delta\boldsymbol\xi$ ({{< code src/math/leastsq_kkt.h leastsq_kkt_feasible_origin >}}).
+5. Apply the stock limiter, the halving line search and the renormalisation of @eq-ch04-equilibrate-tp-update.
+6. After the loop, rebuild the active set and the gain at the final state, encode `diag`.
+
+@fig-ch04-equilibrate-tp-convergence shows the two regimes on a single water reaction: from a ten-fold
+supersaturation the residual falls quadratically once below one, and from a strong undersaturation with cloud present
+the vapour grows geometrically until the last step is clipped and the cloud is exactly zero. The warm start keeps
+`reaction_set` and `nactive` between calls so that the first pass of the next call tests the previously active
+reactions first; the result does not depend on it (@sec-ch04-drivers).
+
+```{python}
+#| label: fig-ch04-equilibrate-tp-convergence
+#| fig-cap: "The fixed-temperature, fixed-pressure adjustment of one water reaction, from the numpy port of the kernel. (a) Condensation from a ten-fold supersaturation at 280 K and 1 bar: the residual per outer iteration (green circles, logarithmic) against the default tolerance (dotted vermillion). (b) Evaporation of a cloud at 300 K and 1 bar when the whole inventory fits in the vapour: vapour (blue circles) and cloud (dashed green triangles) mole fractions per iteration; the vapour grows by a factor near one plus the residual per pass, and the last step is clipped so that the cloud is exactly zero."
+#| fig-alt: "Panel (a): the residual falls from about 2 to below 1e-11 over eight iterations, slowly over the first four and then very fast. Panel (b): the vapour fraction rises from 0.001 to 0.021 over about ten iterations while the cloud fraction falls from 0.02 to zero."
+#| echo: false
+from kintera_report.ch04.figures.fig_equilibrate_tp_convergence import make_fig
+make_fig()
+```
+
+The cells are independent, so the driver runs the kernel per cell under a tensor iterator with a grain size of the
+cell count over the thread count on CPU ({{< code src/thermo/thermo_dispatch.cpp call_equilibrate_tp_cpu >}}) and one
+thread per cell on CUDA ({{< code src/thermo/thermo_dispatch.cu >}}, the subject of @sec-ch12). The kernel's
+workspace is a per-cell arena (`pmalloc`) whose size is fixed by $N$ and $N_{\mathrm r}$ (`[C4]` of `drivers_check.py`).
+
+### Code
+
+| what | code link | symbol | switch |
+|---|---|---|---|
+| the kernel, @eq-ch04-equilibrate-tp-weight to @eq-ch04-equilibrate-tp-update | {{< code src/thermo/equilibrate_tp.h equilibrate_tp >}} | `equilibrate_tp` | always |
+| constrained least squares, @eq-ch04-equilibrate-tp-newton | {{< code src/math/leastsq_kkt.h leastsq_kkt_feasible_origin >}} | `leastsq_kkt_feasible_origin` | always |
+| the driver | {{< code src/thermo/thermo_x.cpp ThermoXImpl::forward >}} | `ThermoXImpl::forward` | `warm_start`, `diag` |
+| CPU dispatch | {{< code src/thermo/thermo_dispatch.cpp call_equilibrate_tp_cpu >}} | `call_equilibrate_tp_cpu` | always |
+| iteration cap and tolerance | {{< code src/thermo/thermo.hpp ThermoOptionsImpl::max_iter >}} | `ThermoOptionsImpl::max_iter` | `max-iter`, `ftol` |
+| Python binding | {{< code python/csrc/pythermo.cpp bind_thermo >}} | `bind_thermo` | always |
+
+: Code map of the fixed-temperature, fixed-pressure solver. {#tbl-ch04-equilibrate-tp-code}
+
+Walk-through of `ThermoXImpl::forward` ({{< code src/thermo/thermo_x.cpp ThermoXImpl::forward >}}):
+
+1. No reactions: return an undefined tensor (the no-op).
+2. Allocate `gain` $(\dots, N_{\mathrm r}^2)$ and, unless the caller passed one, `diag` $(\dots, 1)$; decide whether the
+   saved active set can be reused (@sec-ch04-drivers), else reset it to the identity order with `nactive` $= 0$.
+3. Build the tensor iterator over the cells with `gain`, `diag` and `xfrac` as outputs and $T$, $p$, `reaction_set`,
+   `nactive` as inputs; build the curve kinds and parameters; dispatch to the device kernel with `ftol` and
+   `max-iter`.
+4. Return `gain` viewed as $(\dots, N_{\mathrm r}, N_{\mathrm r})$; `xfrac` was adjusted in place.
+
+The kernel's own input checks print to standard output and return status 1: a non-positive $T$ or $p$, a negative
+gas fraction, no gas at all; a negative condensate amount is set to zero with a warning. In Python:
+
+```python
+diag = torch.zeros(temp.shape + (1,), dtype=torch.float64)
+gain = tx.forward(temp, pres, xfrac, False, diag)   # xfrac adjusted in place
+failed = (diag[..., 0] < 0).sum()
+```
+
+### Tests
+
+| test (ctest name) | what it asserts | tolerance | where the tolerance comes from |
+|---|---|---|---|
+| `tests/test_thermo.cpp` (`test_thermo`), `DeviceTest.equilibrate_tp`, `DeviceTest.equilibrate_tp_batch` | after `forward` the mole fractions still sum to one, on the Jupiter and Earth cards, batches of 6 and 102 cells | `allclose`, $10^{-4}$ | set in the test; the renormalisation makes it exact |
+| `tests/test_equilibrate_tp_max_iter.cpp` (`test_equilibrate_tp_max_iter`), `equilibrate_tp.converges_on_its_last_allowed_iteration` | a solve that needs $n$ passes succeeds with `max-iter` $= n$ and gives the same state | exact (`EXPECT_DOUBLE_EQ`) | the same arithmetic |
+| `tests/test_equilibrate_tp_max_iter.cpp` (`test_equilibrate_tp_max_iter`), `equilibrate_tp.returns_failure_when_it_does_not_converge` | one pass from far away returns status $\ge 20$, `diag` $< 0$ and a state away from equilibrium | $> 10^{-3}$ in $x_v$ | the known equilibrium of the manufactured curve |
+| `tests/test_saturation_adjustment_nh4sh.py` (`test_saturation_adjustment_nh4sh.py`), `test_thermox_keeps_condensates_non_negative` | 2000 random cells with two clouds sharing a vapour: no negative condensate | $-10^{-12}$ of the non-dry total | round-off of the renormalisation |
+| `tests/test_inline_svp.py` (`test_inline_svp.py`), `test_antoine_equilibrate_tp_saturates` | after `forward`, $|\varphi - 1| < 10^{-8}$ in every cloudy cell and $\varphi < 1$ in the others, 2503 temperatures | $10^{-8}$ | `ftol` $10^{-12}$ in the log quotient, with margin |
+| `tests/test_cuda_workspace.py` (`test_cuda_workspace.py`), `test_equilibrate_tp_cuda_matches_cpu` | eight condensables, 200 cells: the CUDA result equals the CPU result | rtol $10^{-10}$, atol $10^{-14}$ | the same algorithm in the same precision; the margin is for summation order |
+| `tests/test_thermo.cpp` (`test_thermo`), the feasible-origin suite (`LeastSquaresKkt` with the origin policy) | the constrained solve on recorded shared-reactant steps: bound held exactly, dependent row skipped, infeasible origin refused | $10^{-12}$ or exact | per case |
+| `src/kintera_report/ch04/checks/equilibrate_tp_check.py` | the gain is the derivative; quadratic convergence; the clipped evaporation; the renormalisation; `diag` | symbolic; $10^{-10}$; exact | algebra; the port's tolerance |
+
+: Tests of the fixed-temperature, fixed-pressure solver. {#tbl-ch04-equilibrate-tp-tests}
+
+The C++ cases passed on CPU and CUDA, float and double, in the recorded CUDA-build run, and the two
+`equilibrate_tp` cases passed in the same run;[^ch04-equilibrate-tp-run] the Python files passed in the recorded CPU
+and CUDA runs.[^ch04-equilibrate-tp-cuda] [^ch04-equilibrate-tp-cpu] The port converges on the water example to
+$|r| = 3.8\times10^{-12}$ in eight passes with $\max_k |r_{k+1}|/r_k^2 = 0.66$ (`[C2]`). No test measures the
+iteration count distribution on a realistic column, and no test exercises the solver in single precision on CPU
+beyond the device-parameterised smoke cases.
+
+[^ch04-equilibrate-tp-run]: [sha: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45; deck: `tests/jupiter.yaml`,
+    `tests/earth.yaml`; run: `ctest -R 'test_thermo|test_equilibrate_tp_max_iter' -V` in the `tests/` directory of a
+    CUDA build (`cmake -DCUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120`), CPU and CUDA (one RTX 5090), float and double;
+    `test_thermo` 66 passed, 8 skipped; `test_equilibrate_tp_max_iter` 2 passed; gcc 11.5.0, CUDA 12.9,
+    cmake 3.31.8, libtorch of torch 2.10.0+cu128]
+
+[^ch04-equilibrate-tp-cuda]: [sha: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45; deck: the cards each test
+    writes; run: `PYTHONPATH=<install-dir> pytest tests/test_cuda_workspace.py tests/test_reaction_equilibrium.py tests/test_warm_start_shape.py tests/test_thermo_x_warm_start_shape.py tests/test_saturation_failure_reported.py`,
+    CPU and CUDA (one RTX 5090), float and double; 135 passed; Python 3.11.13, torch 2.10.0+cu128, numpy 2.4.6]
+
+[^ch04-equilibrate-tp-cpu]: [sha: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45; deck: the cards each test
+    writes; run: `PYTHONPATH=<install-dir> pytest tests/test_equilibrium.py tests/test_nasa9_cp.py tests/test_h2_cp.py tests/test_inline_svp.py tests/test_equilibrate_uv_gain.py tests/test_latent_heat_sign.py tests/test_saturation_adjustment_nh4sh.py tests/test_saturation_degenerate_bound.py tests/test_effective_cp_heap_state.py tests/test_earth.py tests/test_reference_state_keys.py`,
+    CPU, double; 47 passed; Python 3.11.13, torch 2.10.0+cu128, numpy 2.4.6]
+
+### Limits
+
+::: {.callout-warning title="Limits"}
+- `max-iter` (default 10) is shared with the Newton loops of @sec-ch03; the tests that need it raise it to 15, 20 or
+  50, and the deep-Jupiter card to 200. A cell that reaches the cap is returned partially adjusted and the kernel
+  prints `did not converge` to standard output once per cell, which on CUDA is a device printf.
+- The first phase from a strong undersaturation is slow (a factor $1 + |r|$ per pass on the vapour), so a card whose
+  default `max-iter` is 10 can fail on evaporation from a very dry state; not measured on a realistic column.
+- The solver is a local method: with several condensates competing for one vapour it converges to a point that
+  satisfies the complementarity conditions, not necessarily the global minimum of the Gibbs energy; the in-tree
+  note states the same caveat. Not measured.
+- Input checks print and return status 1 instead of throwing; a host that ignores `diag` and standard output
+  does not see them.
+- The kernel's per-cell workspace is fixed by $N$ and $N_{\mathrm r}$; on CUDA a card with many condensables needs
+  a smaller block (@sec-ch12, `test_cuda_workspace.py`).
+:::

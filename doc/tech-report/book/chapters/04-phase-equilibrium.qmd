@@ -1,3 +1,47 @@
 # Phase equilibrium of multiple condensables {#sec-ch04}
 
-pending
+This chapter describes how kintera brings a mixture of gases and pure condensates to phase equilibrium when several
+species can condense at once, including reactions that combine two vapours into one solid or release a gas as they
+condense. It opens with the saturation conditions themselves: phase change written as a reaction of the nucleation
+type, its reaction quotient, the logarithmic residual that measures the distance from the curve, and the two-sided
+condition (equality with a cloud, inequality without) that decides which phases are present. Three solvers enforce
+those conditions: the fixed-temperature, fixed-pressure adjustment of the mole basis, a Newton iteration on the
+reaction extents with a constrained least-squares step; the fixed-energy, fixed-volume adjustment of the mass basis,
+which eliminates the temperature through the energy constraint and recovers it by a caloric inversion after every
+step; and the partition solver, a scalar bracket-and-Newton search in temperature for cards whose reactions are
+disjoint vapour-cloud pairs, tried first under the default setting. The last section is the layer a host sees: the
+batched drivers with their warm starts, the per-cell diagnostic and the failure count. The state vectors, the
+caloric functions and the entropy the solvers rely on are those of @sec-ch03; the saturation curves are the data of
+@sec-ch02; the constrained least-squares solver is the subject of @sec-ch10; the solver of the chemical equilibrium
+of @sec-ch05 is a different method (equilibrium constants from the Gibbs energies of the species, not saturation
+curves) and is not treated here. Every scheme ends with an executable check under
+`src/kintera_report/ch04/checks/` whose output is committed next to it.
+
+```{python}
+#| label: fig-ch04-depmap
+#| fig-cap: "Dependency map of the chapter: the five schemes as nodes and \"requires\" as green arrows, with the two chapters it leans on in grey. The saturation conditions, built on the state and caloric functions of the previous chapter, feed the fixed-temperature solver; that solver and the constrained least-squares core feed the fixed-energy solver and the drivers; the partition solver is an alternative first step inside the fixed-energy solver."
+#| fig-alt: "Five filled boxes connected by arrows: saturation conditions to fixed-temperature solver, to fixed-energy solver, to batched drivers; partition solver below pointing up to the fixed-energy solver; two grey boxes, state and caloric functions of chapter 3 pointing to the saturation conditions, and KKT least squares of chapter 10 pointing to the fixed-temperature solver."
+#| echo: false
+from kintera_report.ch04.figures.fig_ch04_depmap import make_fig
+make_fig()
+```
+
+| scheme | YAML key or option | default | order | main test |
+|---|---|---|---|---|
+| @sec-ch04-conditions | `type: nucleation`, `rate-constant: {formula}` | no reactions: no phase change | exact | `test_reaction_equilibrium.py` |
+| @sec-ch04-equilibrate-tp | `ThermoX.forward`, `max-iter`, `ftol` | 10, $10^{-6}$ | quadratic near the solution | `equilibrate_tp` of `test_thermo` |
+| @sec-ch04-equilibrate-uv | `uv-solver: kkt` | `auto` | quadratic near the solution | `equilibrate_uv` of `test_thermo` |
+| @sec-ch04-uv-partition | `uv-solver: partition` | tried first under `auto` | quadratic inside the bracket | `test_cuda_workspace.py` |
+| @sec-ch04-drivers | `warm_start`, `diag` | off, allocated inside | exact (bookkeeping) | `test_saturation_failure_reported.py` |
+
+: The schemes of this chapter. {#tbl-ch04-schemes}
+
+{{< include 04-phase-equilibrium/_conditions.qmd >}}
+
+{{< include 04-phase-equilibrium/_equilibrate-tp.qmd >}}
+
+{{< include 04-phase-equilibrium/_equilibrate-uv.qmd >}}
+
+{{< include 04-phase-equilibrium/_uv-partition.qmd >}}
+
+{{< include 04-phase-equilibrium/_drivers.qmd >}}

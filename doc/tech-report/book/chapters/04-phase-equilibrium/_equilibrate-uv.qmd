@@ -1,0 +1,223 @@
+## Saturation adjustment at fixed energy and volume (`uv-solver: kkt`) {#sec-ch04-equilibrate-uv}
+
+<!-- PROVENANCE
+pin: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45 (main)
+sources: src/thermo/equilibrate_uv.h, src/thermo/thermo_y.cpp, src/thermo/thermo_dispatch.cpp, src/math/leastsq_kkt.h, docs/source/equilibrium_algorithms.rst, tests/test_thermo.cpp, tests/test_saturation_adjustment_nh4sh.py, tests/test_saturation_degenerate_bound.py, tests/test_equilibrate_uv_gain.py, tests/test_cuda_workspace.py, tests/test_reaction_equilibrium.py
+status: draft
+author: Tianhao Le (happysky19)
+reviewer: Xinyue (requested)
+-->
+
+### Summary
+
+A hydrodynamic host does not know the temperature of a cell after a step; it knows the cell's density, its total
+internal energy and its mass fractions, and condensation inside the cell changes the temperature through the latent
+heat. This solver is the fixed-energy, fixed-volume counterpart of @sec-ch04-equilibrate-tp: it adjusts the
+concentrations and the temperature together so that the saturation conditions hold *at the temperature the
+adjustment itself produces* and the internal energy is unchanged. The temperature is eliminated from the Newton
+system through the energy constraint, which adds a latent-heat term to the Jacobian of every reaction, and after
+each composition step the temperature is recovered by a scalar Newton inversion of the caloric functions of
+@sec-ch03-caloric. For cards whose reactions are disjoint vapour-cloud pairs the module first tries the cheaper
+partition solver of @sec-ch04-uv-partition and falls back to this one.
+
+::: {.callout-note title="At a glance"}
+**Purpose.** Solve @eq-ch04-conditions-complementarity at fixed $(U, V)$ with the reduced Newton system
+@eq-ch04-equilibrate-uv-reduced and the energy constraint @eq-ch04-equilibrate-uv-energy.
+
+**Data.** In: $\rho$ [$\mathrm{kg\,m^{-3}}$], $U$ [$\mathrm{J\,m^{-3}}$], $y_i$ (first axis), in place; out: adjusted
+$y_i$, the gain $\mathsf G$, `diag`; the equilibrium $T$ is recovered by `VU->T` afterwards.
+
+**Placement.** `ThermoY.forward`, the saturation-adjustment step of the dynamical hosts (@sec-ch14); kernel
+`equilibrate_uv`.
+
+**Activation.** `dynamics/equation-of-state: {uv-solver: kkt|auto|partition}`, default `auto`: partition first when
+the network allows it, this solver otherwise; `max-iter` (10) and `ftol` ($10^{-6}$) as in @sec-ch04-equilibrate-tp.
+
+**Guarantee / limits.** Energy conserved to the caloric inversion's tolerance; concentrations non-negative; the
+temperature loop is bounded (100 passes) with a precision-aware stop so that single precision does not oscillate.
+
+**Evidence.** The Tests layer below: energy round trips on CPU and CUDA, the depleted-cloud and degenerate-bound
+regressions, 2000 random Jupiter cells with at most 10 failures reported.
+:::
+
+Local symbols: $c_i$ concentrations [$\mathrm{mol\,m^{-3}}$] (`conc`); $u_i(T)$ the molar internal energy and
+$C_V = \sum_i c_i\,\mathrm du_i/\mathrm dT$ the volumetric heat capacity (`intEng`, `heat_capacity`);
+$U_0$ the prescribed energy density (`h0`); $L'_j = \mathrm dL_j/\mathrm dT$; $b_j = A_j/T - L'_j$ the temperature
+derivative of the residual; $\mathsf D$ the composition part of the weight, $D_{ji} = a_{ij}/c_i$; $\mathsf W^{UV}$
+the reduced weight; $\delta T$ the temperature increment. The extents here are per volume
+[$\mathrm{mol\,m^{-3}}$]. The code calls the solver selector `uv_solver` with the values `0` (kkt), `1` (auto),
+`2` (partition).
+
+### Derivation
+
+**The coupled system.** In concentration units the residual of @sec-ch04-conditions is
+$r_j = \sum_{i<N_{\mathrm g}} a_{ij}\ln c_i - \bigl(L_j(T) - A_j\ln(\mathcal R T)\bigr)$; it depends on the
+composition through the first sum and on the temperature through the bracket, whose derivative is
+$-b_j = L'_j - A_j/T$. The energy is $U(T, \mathbf c) = \sum_i c_i u_i(T)$ with $\partial U/\partial T = C_V$ and
+$\partial U/\partial\xi_k = \sum_i u_i\nu_{ik}$. Newton's method on the residuals and the energy together is
+$$
+\begin{pmatrix} \mathsf D\mathsf N & \mathbf b \\ \mathbf u^{\mathrm T}\mathsf N & C_V \end{pmatrix}
+\begin{pmatrix} \Delta\boldsymbol\xi \\ \delta T \end{pmatrix}
+= -\begin{pmatrix} \mathbf r \\ U - U_0 \end{pmatrix}, \qquad
+D_{ji} = \frac{a_{ij}}{c_i} \;(i < N_{\mathrm g}), \quad D_{ji} = 0 \;(i \ge N_{\mathrm g}).
+$$ {#eq-ch04-equilibrate-uv-coupled}
+There is no $-A_j/c_{\mathrm g}$ term now: at fixed volume the partial pressures are $c_i\mathcal R T$ and do not share
+a normalisation. When the current state already has the right energy ($U = U_0$, which the caloric inversion below
+guarantees at the start of every pass), the second row gives $\delta T = -\mathbf u^{\mathrm T}\mathsf N\Delta\boldsymbol\xi/C_V$,
+and substituting into the first row eliminates the temperature:
+$$
+\mathsf W^{UV}\mathsf N\,\Delta\boldsymbol\xi = -\mathbf r, \qquad
+W^{UV}_{ji} = D_{ji} + \Bigl(L'_j - \frac{A_j}{T}\Bigr)\frac{u_i}{C_V} .
+$$ {#eq-ch04-equilibrate-uv-reduced}
+The added term is the latent-heat coupling: a step that condenses releases energy, warms the cell by
+$\delta T$, and moves every curve by $L'_j\delta T$. @eq-ch04-equilibrate-uv-reduced is computed in
+`equilibrate_uv` ({{< code src/thermo/equilibrate_uv.h equilibrate_uv >}}) as `weight[i] = logsvp_ddT[j] * intEng[i] /
+heat_capacity + nu/conc[i]`, where `logsvp_ddT[j]` already holds $L'_j - A_j/T$; the elimination is verified
+symbolically in `[C1]` of `equilibrate_uv_check.py`. The reduced system is handed to the same constrained
+least-squares solver as @sec-ch04-equilibrate-tp with the bounds $c_i + \sum_k\nu_{ik}\Delta\xi_k \ge 0$, followed by
+the same stock limiter; the line search differs: instead of halving, the factor is reduced by $0.99$ until no gas
+changes by more than a factor $100$ either way (`[C4]`: one reduction for a step to zero, 70 for an overshoot to
+minus the start, 230 for a hundredfold increase), and a factor that underflows is a failure.
+
+**The caloric inversion.** After the composition step the energy is restored by solving $U(T, \mathbf c) = U_0$ for
+$T$ at the new composition:
+$$
+T \leftarrow T + \frac{U_0 - \sum_i c_i u_i(T)}{\sum_i c_i\,u_i'(T)}, \qquad
+\text{until } |T - T_{\mathrm{prev}}| \le \max\bigl(10^{-4}\,\mathrm K,\; 8\,\epsilon_{\mathrm{mach}}\,T\bigr),
+$$ {#eq-ch04-equilibrate-uv-energy}
+with at most 100 passes (`[C3]`: $10^{-4}\,\mathrm K$ in double, $2.9\times10^{-4}\,\mathrm K$ in single precision at
+$300\,\mathrm K$, so that a float32 sum cannot oscillate below its own resolution). @eq-ch04-equilibrate-uv-energy is
+computed in the same `equilibrate_uv` ({{< code src/thermo/equilibrate_uv.h equilibrate_uv >}}); the energies and
+heat capacities are the baseline of @sec-ch03-caloric plus the optional extra functions, evaluated per species
+inside the kernel. With constant heat capacities the inversion is exact in one step and the loop runs twice (the
+second pass confirms the stop); a non-positive or non-finite temperature after the inversion is a failure (status 4).
+
+**What the iteration returns.** As in @sec-ch04-equilibrate-tp the gain of the active block is scattered into the
+$N_{\mathrm r}\times N_{\mathrm r}$ output with the correct leading dimension (zero rows and columns for inactive
+reactions), and `diag` encodes the iteration count or $-(100\,s + n)$. Exact: energy conservation to the stop of
+@eq-ch04-equilibrate-uv-energy (round-off on the water example, `[C2]`: $4\times10^{-16}$ relative) and the mole
+inventories of every reaction. Approximate: the linearisation, and the elimination of $\delta T$ assumes $U = U_0$ at
+the start of the pass, which the inversion makes true to its tolerance. The temperature rises on condensation by
+$\ell\,\delta c/C_V$ (`[C5]`: $36\,\mathrm K$ per $\mathrm{mol\,m^{-3}}$ of water at the example's density). The check
+is `equilibrate_uv_check.py`, a numpy port of the kernel's KKT branch for one reaction.
+
+### Numerical method
+
+One outer pass, for one cell:
+
+1. Evaluate $u_i(T)$, $u_i'(T)$, $L_j(T) - A_j\ln\mathcal R T$ and $L'_j - A_j/T$ at the current temperature; $C_V$.
+2. Active-set test of @sec-ch04-conditions on the concentrations; stop if the block is empty.
+3. Assemble $\mathsf W^{UV}$ and $\mathsf G$; constrained least squares
+   ({{< code src/math/leastsq_kkt.h leastsq_kkt_feasible_origin >}}); stock limiter; the $0.99$ line search.
+4. Caloric inversion @eq-ch04-equilibrate-uv-energy at the new composition.
+
+@fig-ch04-equilibrate-uv-convergence shows the residual and the temperature per pass for one water reaction at
+fixed energy: the temperature rises by $34\,\mathrm K$ as the cloud forms, the residual converges quadratically, and
+the energy error of every iterate is at round-off because the inversion closes each pass. The driver computes the
+starting temperature from the energy (`VU->T`) and hands the kernel the concentrations and $U_0$; on return it
+converts the concentrations back to mass fractions and leaves the host to recover $T$ and $p$ with `VU->T` and
+`VT->P` (@sec-ch03-eos).
+
+```{python}
+#| label: fig-ch04-equilibrate-uv-convergence
+#| fig-cap: "The fixed-energy, fixed-volume adjustment of one water reaction from a ten-fold supersaturation at 280 K, from the numpy port of the kernel's constrained-least-squares branch. (a) The saturation residual (green circles) and the energy error of each iterate (dotted blue squares) per outer pass, logarithmic, against the default tolerance (dotted vermillion). (b) The temperature per pass: the latent heat of the forming cloud warms the cell by 34 K."
+#| fig-alt: "Panel (a): the residual falls from 2 to 1e-13 in five passes while the energy error stays near 1e-16 throughout. Panel (b): the temperature rises from 280 K to about 314 K, most of it in the first two passes."
+#| echo: false
+from kintera_report.ch04.figures.fig_equilibrate_uv_convergence import make_fig
+make_fig()
+```
+
+The solver selection happens once per call in the driver ({{< code src/thermo/thermo_y.cpp ThermoYImpl::forward >}}):
+`kkt` always runs this kernel; `auto` runs the partition solver first when the network is partitionable
+(`uv_partitionable`, decided in `reset`) and this kernel when it fails or the network is not; `partition` refuses
+a non-partitionable network with `UV partition solver requires disjoint vapor-cloud reactions`. The dispatch to
+CPU threads or CUDA blocks is the same as in @sec-ch04-equilibrate-tp
+({{< code src/thermo/thermo_dispatch.cpp call_equilibrate_uv_cpu >}}).
+
+### Code
+
+| what | code link | symbol | switch |
+|---|---|---|---|
+| the kernel, @eq-ch04-equilibrate-uv-reduced and @eq-ch04-equilibrate-uv-energy | {{< code src/thermo/equilibrate_uv.h equilibrate_uv >}} | `equilibrate_uv` | `uv-solver` |
+| constrained least squares | {{< code src/math/leastsq_kkt.h leastsq_kkt_feasible_origin >}} | `leastsq_kkt_feasible_origin` | always |
+| the driver and solver selection | {{< code src/thermo/thermo_y.cpp ThermoYImpl::forward >}} | `ThermoYImpl::forward` | `uv-solver`, `warm_start` |
+| eligibility of the partition branch | {{< code src/thermo/thermo_y.cpp ThermoYImpl::reset >}} | `ThermoYImpl::reset` | always |
+| CPU dispatch | {{< code src/thermo/thermo_dispatch.cpp call_equilibrate_uv_cpu >}} | `call_equilibrate_uv_cpu` | always |
+| the option | {{< code src/thermo/thermo.hpp ThermoOptionsImpl::uv_solver >}} | `ThermoOptionsImpl::uv_solver` | `uv-solver` |
+| reading the option | {{< code src/thermo/thermo_options.cpp ThermoOptionsImpl::from_yaml overload=2 >}} | `ThermoOptionsImpl::from_yaml` | `dynamics/equation-of-state` |
+
+: Code map of the fixed-energy, fixed-volume solver. {#tbl-ch04-equilibrate-uv-code}
+
+Walk-through of `ThermoYImpl::forward` ({{< code src/thermo/thermo_y.cpp ThermoYImpl::forward >}}):
+
+1. No reactions: no-op. Otherwise `DY->V` gives the partial densities, `VU->T` the starting temperature and `VT->P`
+   a pressure (computed, not used by the kernel).
+2. Warm-start decision and allocation of `gain` and `diag` as in @sec-ch04-equilibrate-tp.
+3. The kernel receives the concentrations $\rho_i/M_i$, $U_0$, the energy offsets $u^\star_i$ and heat capacities per
+   mole (`u0 / inv_mu`, `cv0 / inv_mu`), the curves and the solver code; an invalid `uv-solver` string throws
+   `Invalid UV solver`.
+4. The failure count is updated from `diag` (@sec-ch04-drivers); the concentrations are converted back and copied
+   into `yfrac` in place.
+
+The kernel's input checks return status 1 with a printed message for a non-positive temperature, invalid dimensions
+or a negative heat capacity; a negative concentration is clamped to zero with a warning. In Python, the usual host
+sequence:
+
+```python
+ivol = ty.compute("DY->V", [rho, yfrac])
+U = ty.compute("VT->U", [ivol, temp])
+gain = ty.forward(rho, U, yfrac, False, diag)       # yfrac adjusted in place
+temp_new = ty.compute("VU->T", [ty.compute("DY->V", [rho, yfrac]), U])
+```
+
+### Tests
+
+| test (ctest name) | what it asserts | tolerance | where the tolerance comes from |
+|---|---|---|---|
+| `tests/test_thermo.cpp` (`test_thermo`), `DeviceTest.equilibrate_uv`, `DeviceTest.equilibrate_uv_batch` | after `forward` the energy recomputed from the adjusted state equals the input, on the Jupiter card, 6 and 102 cells | `allclose`, $10^{-4}$ | set in the test; the inversion closes to $10^{-4}\,\mathrm K$ |
+| `tests/test_thermo.cpp` (`test_thermo`), `DeviceTest.equilibrate_uv_depleted_cloud` | a nearly depleted cloud is taken to exactly zero, inventories conserved, energy closed; a trace state; `max-iter` 1 returns `diag` 1 and a zero gain; the three solver settings agree | $10^{-12}$ (inventory), $10^{-8}\,\mathrm{J\,m^{-3}}$ (energy), $10^{-6}\,\mathrm K$ | round-off; the inversion's stop; set in the test |
+| `tests/test_saturation_adjustment_nh4sh.py` (`test_saturation_adjustment_nh4sh.py`), `test_listed_cells_are_adjusted_at_default_budget`, `test_no_cell_fails_silently` | four recorded cells adjust within `max-iter` 10; of 2000 random cells none is unadjusted with `diag` $\ge 0$ and at most 10 fail | $10^{-5}$ in $\varphi$; N and S conserved to $10^{-12}$ | the solver's `ftol` with margin; round-off |
+| `tests/test_saturation_degenerate_bound.py` (`test_saturation_degenerate_bound.py`) | five recorded cells with an absent reactant on a degenerate bound converge; the final state is saturated or undersaturated without cloud | $10^{-4}$ in $\ln\varphi$ | set in the test |
+| `tests/test_equilibrate_uv_gain.py` (`test_equilibrate_uv_gain.py`) | the gain is zero outside the active block, zero after a converged warm start, supported on the block when the solve exits active | exact zero | the scatter writes nothing elsewhere |
+| `tests/test_reaction_equilibrium.py` (`test_reaction_equilibrium.py`), `test_isolated_reaction` (UV), `test_shared_h2_and_h2s` | 13 families and a coupled two-cloud network against an independent bisection, CPU and CUDA, single and double | $2\times10^{-6}$, $2\times10^{-3}$ | the in-tree validation thresholds |
+| `tests/test_cuda_workspace.py` (`test_cuda_workspace.py`), `test_equilibrate_uv_cuda_matches_cpu` | eight pairs, both solver settings: CUDA equals CPU | rtol $10^{-10}$, atol $10^{-14}$ | same algorithm, summation order |
+| `src/kintera_report/ch04/checks/equilibrate_uv_check.py` | the reduced weight; convergence with energy closed; the temperature tolerance; the line-search counts; the sign of $\delta T$ | symbolic; $10^{-12}$; exact | algebra; round-off |
+
+: Tests of the fixed-energy, fixed-volume solver. {#tbl-ch04-equilibrate-uv-tests}
+
+The C++ cases passed on CPU and CUDA in the recorded CUDA-build run (the float instances of the depleted-cloud case
+are skipped by the test);[^ch04-equilibrate-uv-run] the Python files passed in the recorded CPU and CUDA
+runs.[^ch04-equilibrate-uv-cuda] [^ch04-equilibrate-uv-cpu] The port converges on the water example in five passes
+to $|r| = 1.9\times10^{-13}$ with the energy closed to $4.4\times10^{-16}$ relative (`[C2]`).
+
+[^ch04-equilibrate-uv-run]: [sha: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45; deck: `tests/jupiter.yaml`
+    and the card the depleted-cloud case embeds; run: `ctest -R 'test_thermo|test_equilibrate_tp_max_iter' -V` in
+    the `tests/` directory of a CUDA build (`cmake -DCUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120`), CPU and CUDA (one
+    RTX 5090), float and double; `test_thermo` 66 passed, 8 skipped; gcc 11.5.0, CUDA 12.9, cmake 3.31.8, libtorch of
+    torch 2.10.0+cu128]
+
+[^ch04-equilibrate-uv-cuda]: [sha: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45; deck: the cards each test
+    writes; run: `PYTHONPATH=<install-dir> pytest tests/test_cuda_workspace.py tests/test_reaction_equilibrium.py tests/test_warm_start_shape.py tests/test_thermo_x_warm_start_shape.py tests/test_saturation_failure_reported.py`,
+    CPU and CUDA (one RTX 5090), float and double; 135 passed; Python 3.11.13, torch 2.10.0+cu128, numpy 2.4.6]
+
+[^ch04-equilibrate-uv-cpu]: [sha: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45; deck: the cards each test
+    writes; run: `PYTHONPATH=<install-dir> pytest tests/test_equilibrium.py tests/test_nasa9_cp.py tests/test_h2_cp.py tests/test_inline_svp.py tests/test_equilibrate_uv_gain.py tests/test_latent_heat_sign.py tests/test_saturation_adjustment_nh4sh.py tests/test_saturation_degenerate_bound.py tests/test_effective_cp_heap_state.py tests/test_earth.py tests/test_reference_state_keys.py`,
+    CPU, double; 47 passed; Python 3.11.13, torch 2.10.0+cu128, numpy 2.4.6]
+
+### Limits
+
+::: {.callout-warning title="Limits"}
+- The energy released is the card's latent heat (the offsets of @sec-ch03-reference-state), while the curve moves
+  with the fit's; a card that is not Kirchhoff-consistent reaches an equilibrium temperature that no single
+  substance would. `tests/jupiter.yaml` is such a card; not measured.
+- The random-cell test tolerates up to 10 failures in 2000 Jupiter-like cells at `max-iter` 50: the solver is not
+  guaranteed to converge from every state, and a host must read `diag` or the failure count
+  (@sec-ch04-drivers).
+- The $0.99$ line search can take hundreds of reductions for a step that would increase a gas a hundredfold; the
+  stock limiter prevents the decreasing cases but not that one. Not measured on a realistic column.
+- The elimination of $\delta T$ is exact only when the pass starts with $U = U_0$; the first pass starts from the
+  driver's `VU->T`, which is exact for the baseline heat capacities and iterative otherwise.
+- Single precision: the temperature stop is widened to $8\,\epsilon_{\mathrm{mach}} T$ and the validation thresholds
+  to $2\times10^{-3}$; the in-tree note records that requested tolerances below float32 resolution produce failure
+  diagnostics.
+:::

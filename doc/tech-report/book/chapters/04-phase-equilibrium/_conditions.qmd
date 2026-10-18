@@ -1,0 +1,218 @@
+## Phase-change reactions and the saturation conditions (`type: nucleation`) {#sec-ch04-conditions}
+
+<!-- PROVENANCE
+pin: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45 (main)
+sources: src/thermo/nucleation.hpp, src/thermo/nucleation.cpp, src/thermo/svp_eval.h, src/thermo/log_svp.hpp, src/thermo/log_svp.cpp, src/thermo/equilibrate_tp.h, src/vapors/vapor_functions.h, src/reaction.hpp, src/thermo/thermo_options.cpp, docs/source/equilibrium_algorithms.rst, tests/jupiter.yaml, examples/jupiter_kcl_mgsio3.yaml
+status: draft
+author: Tianhao Le (happysky19)
+reviewer: Xinyue (requested)
+-->
+
+### Summary
+
+A condensable in kintera is not a species with a saturation curve; it is a *reaction* of the nucleation type whose
+reactants are gases and whose products include a pure condensed phase, with an equilibrium constant that the card
+names through its `rate-constant` entry. Writing phase change as a reaction is what lets one solver handle water
+condensing to ice, ammonia and hydrogen sulfide combining into ammonium hydrosulfide, and a silicate forming from
+three gases while releasing hydrogen. This section defines the reaction quotient and its saturation value, the
+residual that measures the distance from equilibrium, and the two-sided condition (equality when the condensate is
+present, inequality when it is absent) that every solver of this chapter enforces. The conditions are those of the
+multiple-condensable theory of Li, Ingersoll and Oyafuso
+([J. Atmos. Sci. 75, 1063, 2018](https://doi.org/10.1175/JAS-D-17-0257.1)), written for pressures in pascals and
+for reactions with arbitrary gas stoichiometry.
+
+::: {.callout-note title="At a glance"}
+**Purpose.** For each nucleation reaction $j$ the residual $r_j$ of @eq-ch04-conditions-residual and the conditions
+@eq-ch04-conditions-complementarity that the equilibrium state satisfies.
+
+**Data.** The reaction list (`equation`, `rate-constant: {formula, ...}`, optional `minT`, `maxT`), the stoichiometric
+matrix `stoich` $(N \times N_{\mathrm r})$, and $L_j(T)$ in $\ln\mathrm{Pa}$ to the power $A_j$.
+
+**Placement.** Read at option construction (`NucleationOptions`); evaluated inside both solvers and by the saturation
+ratio of @sec-ch03-relative-humidity.
+
+**Activation.** A reaction with `type: nucleation`; the `formula` names a built-in curve or an inline `ideal` or
+`antoine` form with its parameters. A reaction with a condensed reactant, or without a condensed product, is refused.
+
+**Guarantee / limits.** Pure condensed phases (unit activity) and ideal gases; the conditions are local to the given
+reaction network and do not discover missing reactions.
+
+**Evidence.** The Tests layer below: 13 manufactured reaction families in `test_reaction_equilibrium.py`, CPU and
+CUDA, single and double.
+:::
+
+Local symbols: $N_{\mathrm r}$ nucleation reactions indexed by $j$; $\nu_{ij}$ the stoichiometric coefficient of
+species $i$ in reaction $j$, positive for products (`stoich`); $a_{ij} = -\nu_{ij}$ for a gas, the exponent of its
+partial pressure in the quotient; $A_j = \sum_{i < N_{\mathrm g}} a_{ij}$ the net number of gas moles consumed;
+$Q_j = \prod_{i<N_{\mathrm g}} p_i^{a_{ij}}$ the reaction quotient [$\mathrm{Pa}^{A_j}$]; $L_j(T) = \ln Q_j^{\mathrm{sat}}(T)$
+its saturation value (the `logsvp` function, `formula`); $r_j$ the saturation residual [-];
+$\varepsilon_{\mathrm{tol}}$ the tolerance on $r_j$ (`ftol`). The species symbols are those of
+@sec-ch03-species-state. The code calls the reactions "nucleation" and their curves "svp"; neither name implies
+kinetics or a vapour-only curve.
+
+### Derivation
+
+A reaction of the card, `NH3 + H2S <=> NH4SH(s)`, is parsed into reactant and product compositions by `Reaction`
+({{< code src/reaction.cpp Reaction::Reaction >}}) and stored as one column $\nu_{\cdot j}$ of the stoichiometric
+matrix, $-1$ for each gas consumed, $+1$ for the condensate ({{< code src/thermo/thermo_y.cpp ThermoYImpl::reset >}}).
+With ideal gases at partial pressures $p_i$ and pure condensed phases at unit activity, the law of mass action for
+reaction $j$ at equilibrium reads $Q_j = Q_j^{\mathrm{sat}}(T)$ with
+$$
+Q_j = \prod_{i < N_{\mathrm g}} p_i^{a_{ij}}, \qquad L_j(T) = \ln Q_j^{\mathrm{sat}}(T), \qquad
+r_j = \sum_{i < N_{\mathrm g}} a_{ij}\ln p_i - L_j(T) = \ln\frac{Q_j}{Q_j^{\mathrm{sat}}} ,
+$$ {#eq-ch04-conditions-residual}
+where every pressure is a number of pascals. For a single vapour condensing, $Q_j = p_v$ and $L_j = \ln p_{\mathrm{sat}}$
+is the logarithm of the saturation vapour pressure, which is where the name `logsvp` comes from; for ammonium
+hydrosulfide $Q_j = p_{\mathrm{NH_3}}p_{\mathrm{H_2S}}$ and $A_j = 2$; for
+$\mathrm{Mn + H_2S \rightleftharpoons MnS(s) + H_2}$ the gaseous product enters with $a = -1$ and $A_j = 1$; for
+$\mathrm{Mg + SiH_4 + 3\,H_2O \rightleftharpoons MgSiO_3(s) + 5\,H_2}$, $A_j = 0$ and the quotient is dimensionless
+(`[C2]` of `conditions_check.py`). The sign convention makes $r_j > 0$ supersaturation. In mole fractions, with
+$p_i = p\,x_i/x_{\mathrm g}$,
+$$
+r_j = \sum_{i < N_{\mathrm g}} a_{ij}\ln\frac{x_i}{x_{\mathrm g}} - \bigl(L_j(T) - A_j\ln p\bigr),
+$$ {#eq-ch04-conditions-residual-x}
+and the fixed-pressure solver evaluates exactly the bracketed shift once per call:
+@eq-ch04-conditions-residual-x is computed in `equilibrate_tp` ({{< code src/thermo/equilibrate_tp.h equilibrate_tp >}})
+as `logsvp[j] - stoich_sum[j] * log(pres)` with `stoich_sum` $= A_j$ (`[C1]`). In concentrations, with
+$p_i = c_i\mathcal R T$, the shift is $A_j\ln(\mathcal R T)$ instead, which is the form of @sec-ch04-equilibrate-uv.
+A published constant in bar is converted by $L_{\mathrm{Pa}} = L_{\mathrm{bar}} + A_j\ln 10^5$; the generic Antoine
+evaluator `logsvp_antoine` ({{< code src/vapors/vapor_functions.h logsvp_antoine >}}) adds $\ln 10^5$ once, which is
+right for $A_j = 1$, so the deep-Jupiter card subtracts $5$ from the Antoine $A$ of its dimensionless silicate
+quotient (`[C3]`).
+
+The equilibrium state satisfies, for every reaction, a two-sided condition. If the condensed products of reaction
+$j$ are present, the quotient sits on the curve; if they are absent, the gases may be undersaturated but not
+supersaturated:
+$$
+r_j = 0 \quad \text{if every condensed product of } j \text{ is present}, \qquad
+r_j \le 0 \quad \text{otherwise}, \qquad x_i \ge 0 \;\text{for all } i .
+$$ {#eq-ch04-conditions-complementarity}
+This is the complementarity condition of a phase that can disappear: the pair (amount of condensate, $-r_j$) has
+both members non-negative and at least one of them zero. Both solvers test it with a tolerance,
+activating reaction $j$ when $r_j > \varepsilon_{\mathrm{tol}}$ (condensation, whether or not a cloud exists) or
+when $r_j < -\varepsilon_{\mathrm{tol}}$ and every condensed product has a positive amount (evaporation); a reaction
+within the band, or undersaturated with nothing to evaporate, is in equilibrium (`[C4]`, @fig-ch04-conditions-complementarity).
+@eq-ch04-conditions-complementarity is enforced in `equilibrate_tp` ({{< code src/thermo/equilibrate_tp.h equilibrate_tp >}})
+and `equilibrate_uv` ({{< code src/thermo/equilibrate_uv.h equilibrate_uv >}}) through that test. Gaseous products
+take no part in the presence test: a reaction whose only products are gases and one condensate is reversed only
+while the condensate exists.
+
+Two edge cases of the logarithm are decided here rather than in the solvers. A gas reactant with zero amount makes
+$\ln p_i$ singular; the kernels replace it by the amount that reaction would have at saturation, $\nu r^\star$ with
+$\nu\ln r^\star = L_j - (\text{the known terms}) - \nu\ln(\nu/x_{\mathrm g})$, and use $1/r^\star$ as the derivative
+(bounded so that it stays finite in single precision), which linearises along a feasible extent without seeding the
+species (`[C5]`). A reaction whose gases are missing on *both* sides (an absent reactant and an absent gaseous
+product) has no feasible direction and is skipped for that pass; another reaction may supply the missing gas on a
+later pass. What is approximate in this section: nothing in the conditions themselves; the curve $L_j(T)$ is a fit
+(@sec-ch02) and the unit-activity assumption excludes solutions and mixed condensates. The executable check is
+`conditions_check.py` (`[C1]` to `[C5]`).
+
+### Numerical method
+
+@fig-ch04-conditions-complementarity draws the admissible set and the decision of the active-set test. The
+quantities live per cell and per reaction: $L_j(T)$ is evaluated for all reactions of all cells in one vectorised
+call ({{< code src/thermo/log_svp.hpp LogSVPFunc::call >}}) outside the kernels, and inside each kernel by the
+scalar `eval_logsvp` ({{< code src/thermo/svp_eval.h eval_logsvp >}}), which switches on a per-reaction kind: a
+built-in function of the vapour table, an inline `ideal` two-branch curve with six parameters, or an inline `antoine`
+curve with three. The inline forms share the helper functions of the built-in curves, so that an inline curve with
+the built-in constants is bit-identical to its named twin (the test `test_ideal_logsvp_bitwise`).
+
+```{python}
+#| label: fig-ch04-conditions-complementarity
+#| fig-cap: "The admissible set of one phase-change reaction in the plane of its saturation residual (horizontal) and its condensate amount (vertical): the thick blue line, the half-line of saturated states with any amount of condensate and the segment of undersaturated states with none. The light band is the tolerance within which a reaction counts as in equilibrium. The green arrows show the two active cases, condensation from the right and evaporation from the upper left; the lower left is in equilibrium with nothing to evaporate."
+#| fig-alt: "A diagram with the residual on the horizontal axis and the condensate amount on the vertical axis. A thick vertical line at zero residual and a thick horizontal segment to its left at zero condensate form the admissible set. Arrows from the right half-plane and from the upper left point toward the vertical line; the lower left region is labelled as in equilibrium."
+#| echo: false
+from kintera_report.ch04.figures.fig_conditions_complementarity import make_fig
+make_fig()
+```
+
+The reaction list is fixed at option construction: `NucleationOptionsImpl::from_yaml`
+({{< code src/thermo/nucleation.cpp NucleationOptionsImpl::from_yaml >}}) reads every reaction with
+`type: nucleation`, its `formula`, `minT` (default $0$) and `maxT` (default $10^4\,\mathrm K$), and for the inline forms
+the parameters `T3`, `P3`, `beta`, `gamma` (and optional `betas`, `gammas` for a solid branch below `T3`) or `A`,
+`B`, `C`. The kernels receive the per-reaction kind and a padded parameter block of six numbers
+(`KSVP_NPARAM`, {{< code src/thermo/svp_eval.h KSVP_NPARAM >}}) built by `LogSVPFunc::make_svp_spec`
+({{< code src/thermo/log_svp.cpp LogSVPFunc::make_svp_spec >}}).
+
+### Code
+
+| what | code link | symbol | switch |
+|---|---|---|---|
+| reaction parsing | {{< code src/reaction.cpp Reaction::Reaction >}} | `Reaction::Reaction` | `equation` |
+| the reaction list and its curves | {{< code src/thermo/nucleation.cpp NucleationOptionsImpl::from_yaml >}} | `NucleationOptionsImpl::from_yaml` | `type: nucleation` |
+| stored options | {{< code src/thermo/nucleation.hpp NucleationOptionsImpl::svp_params >}} | `NucleationOptionsImpl::svp_params` | `formula` |
+| stoichiometric matrix, reactant and product checks | {{< code src/thermo/thermo_y.cpp ThermoYImpl::reset >}} | `ThermoYImpl::reset` | always |
+| $L_j(T)$, scalar, three kinds | {{< code src/thermo/svp_eval.h eval_logsvp >}} | `eval_logsvp` | `formula` |
+| $\mathrm dL_j/\mathrm dT$, scalar | {{< code src/thermo/svp_eval.h eval_logsvp_ddT >}} | `eval_logsvp_ddT` | `formula` |
+| $L_j(T)$, vectorised, with autograd | {{< code src/thermo/log_svp.hpp LogSVPFunc::call >}} | `LogSVPFunc::call` | always |
+| kind and parameter tensors | {{< code src/thermo/log_svp.cpp LogSVPFunc::make_svp_spec >}} | `LogSVPFunc::make_svp_spec` | always |
+| inline parameters present | {{< code src/thermo/log_svp.hpp LogSVPFunc::check_inline >}} | `LogSVPFunc::check_inline` | `ideal`, `antoine` |
+| built-in curves | {{< code src/vapors/vapor_functions.h >}} | `vapor_functions.h` | `formula: <name>` |
+| residual shift, @eq-ch04-conditions-residual-x | {{< code src/thermo/equilibrate_tp.h equilibrate_tp >}} | `equilibrate_tp` | always |
+
+: Code map of the saturation conditions. {#tbl-ch04-conditions-code}
+
+Walk-through:
+
+1. The card's reactions are read in the order written; `'equation' is not defined`, `'rate-constant' is not defined`
+   and `'formula' is not defined` are the errors of a malformed entry, and an inline form missing a parameter
+   (`'T3' required for 'ideal' svp formula`, or `requires T3 > 0 and P3 > 0`) is refused at the same point.
+2. The participants are sorted into the gas and condensate groups (@sec-ch03-species-state); a condensed reactant is
+   refused with `Nucleation reactant must be a gas`, and a gaseous product sets the flag that
+   `relative_humidity` later checks.
+3. `reset` of either module builds `stoich` and refuses a reaction with a negative condensate coefficient or without
+   a condensed product (`Nucleation requires gaseous reactants`, `Nucleation requires a condensed product`).
+4. A `formula` name that is neither built in nor `ideal` or `antoine` fails at the first evaluation with
+   `Function <name> not registered`; an inline name set from Python without parameters fails in `check_inline`.
+
+The three ways to give a curve, from the test cards:
+
+```text
+rate-constant: {formula: h2o_ideal}                        # built in
+rate-constant: {formula: ideal, T3: 273.16, P3: 611.7,     # inline two-branch curve
+                beta: 24.845, gamma: 4.986009, betas: 22.98, gammas: 0.52}
+rate-constant: {formula: antoine, A: 1.238603569690592,    # A - 5, see the text
+                B: 49895., C: 0.}
+```
+
+### Tests
+
+| test (ctest name) | what it asserts | tolerance | where the tolerance comes from |
+|---|---|---|---|
+| `tests/test_reaction_equilibrium.py` (`test_reaction_equilibrium.py`), `test_isolated_reaction` | for 13 reaction families (single vapour, two vapours, gaseous products, $A_j$ from $0$ to $3$) and several initial states, the TP and UV solutions match an independent bisection: state, conservation, energy and complementarity | $2\times10^{-6}$ (double), $2\times10^{-3}$ (single) | the thresholds of the in-tree validation note, documented with the recorded errors |
+| `tests/test_reaction_equilibrium.py` (`test_reaction_equilibrium.py`), `test_missing_gas_on_both_sides_is_blocked` | a reaction with an absent reactant and an absent gaseous product leaves the state unchanged with `diag` $\ge 0$ | exact (TP), $10^{-14}$ (UV) | the state is not touched |
+| `tests/test_inline_svp.py` (`test_inline_svp.py`), `test_ideal_logsvp_bitwise`, `test_ideal_equilibrate_tp_bitwise`, `test_ideal_equilibrate_uv_bitwise` | inline `ideal` with the built-in constants equals the named curve bit for bit, in the ratio and in both solvers | exact | bit comparison |
+| `tests/test_inline_svp.py` (`test_inline_svp.py`), `test_inline_formula_set_from_python_raises`, `test_ideal_rejects_nonpositive_p3` | the parameter checks fire | exact text | exact |
+| `tests/test_vapor_functions.cpp` (`test_vapor_functions`) | the built-in curves against their published values and finite-difference derivatives | as listed per case | per case in the test |
+| `src/kintera_report/ch04/checks/conditions_check.py` | the two residual forms; $A_j$ of the examples; the Antoine shift; the decision table; the absent-reactant linearisation | symbolic; exact | algebra |
+
+: Tests of the saturation conditions. {#tbl-ch04-conditions-tests}
+
+`test_reaction_equilibrium.py` passed in the recorded CPU and CUDA run (its CUDA instances on one RTX 5090), and
+`test_inline_svp.py` in the recorded CPU run.[^ch04-conditions-cuda] [^ch04-conditions-cpu] The manufactured
+families and their reference bisection are described in the in-tree note
+({{< code docs/source/equilibrium_algorithms.rst >}}); their recorded errors are in that note's figures and are
+not reproduced here.
+
+[^ch04-conditions-cuda]: [sha: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45; deck: the cards each test
+    writes; run: `PYTHONPATH=<install-dir> pytest tests/test_cuda_workspace.py tests/test_reaction_equilibrium.py tests/test_warm_start_shape.py tests/test_thermo_x_warm_start_shape.py tests/test_saturation_failure_reported.py`,
+    CPU and CUDA (one RTX 5090), float and double; 135 passed; Python 3.11.13, torch 2.10.0+cu128, numpy 2.4.6]
+
+[^ch04-conditions-cpu]: [sha: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45; deck: the cards each test
+    writes; run: `PYTHONPATH=<install-dir> pytest tests/test_equilibrium.py tests/test_nasa9_cp.py tests/test_h2_cp.py tests/test_inline_svp.py tests/test_equilibrate_uv_gain.py tests/test_latent_heat_sign.py tests/test_saturation_adjustment_nh4sh.py tests/test_saturation_degenerate_bound.py tests/test_effective_cp_heap_state.py tests/test_earth.py tests/test_reference_state_keys.py`,
+    CPU, double; 47 passed; Python 3.11.13, torch 2.10.0+cu128, numpy 2.4.6]
+
+### Limits
+
+::: {.callout-warning title="Limits"}
+- Pure condensed phases only: no solution, no mixed condensate, no activity other than one; a condensate that
+  dissolves another vapour needs a reaction of its own.
+- The conditions are local to the reaction network of the card: a missing reaction is not discovered, and a
+  reaction whose products are all gases is not a phase change and is refused.
+- `minT` and `maxT` are stored but not consulted by the solvers at the pin; a curve is evaluated wherever the
+  solver asks, including the extrapolated solid branch of an `ideal` curve below `T3`.
+- The absent-gas linearisation regularises the derivative only; a reaction whose gases are missing on both sides
+  stays blocked until another reaction creates one, and a network where none can is left unadjusted with
+  `diag` $\ge 0$ (not a failure, by the test above).
+- Not measured: how far the unit-activity assumption is from a dilute solution for the Jupiter clouds.
+:::

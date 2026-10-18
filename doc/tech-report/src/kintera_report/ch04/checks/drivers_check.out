@@ -1,0 +1,8 @@
+[C1] PASS diag [3.0, 1.0, -2010.0, -403.0, -100.0, 7.0] -> (status, iterations) [(0, 3), (0, 1), (20, 10), (4, 3), (1, 0), (0, 7)]; failures 3
+[C2] PASS warm start reused in 1 of 5 cases (same shape and device only)
+[C3] PASS scattered gain:
+[[ 2.5  0.   0.3]
+ [ 0.   0.   0. ]
+ [-0.2  0.   1.5]]
+[C4] PASS workspace per cell for nspecies 17, nreaction 8, double: equilibrate_tp 3152 B own + 7000 B KKT = 10152 B (10.2 KB), equilibrate_uv 10424 B (10.4 KB); 32-thread block 325 KB (TP)
+drivers_check: 4 of 4 passed

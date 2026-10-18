@@ -1,0 +1,265 @@
+## The batched drivers: warm starts, diagnostics and failure reporting (`ThermoX.forward`, `ThermoY.forward`) {#sec-ch04-drivers}
+
+<!-- PROVENANCE
+pin: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45 (main)
+sources: src/thermo/thermo_x.cpp, src/thermo/thermo_y.cpp, src/thermo/thermo.hpp, src/thermo/thermo_dispatch.cpp, src/thermo/thermo_dispatch.cu, src/thermo/thermo_dispatch.hpp, src/loops.cuh, src/utils/alloc.h, src/thermo/equilibrate_tp.h, src/thermo/equilibrate_uv.h, python/csrc/pythermo.cpp, tests/test_warm_start_shape.py, tests/test_thermo_x_warm_start_shape.py, tests/test_saturation_failure_reported.py, tests/test_equilibrate_uv_gain.py, tests/test_cuda_workspace.py, tests/test_alloc_space.cpp, tests/test_thermo.cpp
+status: draft
+author: Tianhao Le (happysky19)
+reviewer: Xinyue (requested)
+-->
+
+### Summary
+
+The kernels of @sec-ch04-equilibrate-tp and @sec-ch04-equilibrate-uv work on one cell. A host hands kintera a
+whole domain at once: a tensor of temperatures and pressures with the species on the last axis (`ThermoX`), or
+densities and energies with the species on the first axis (`ThermoY`). The two `forward` methods are the layer
+in between. They allocate the outputs, decide whether the active set saved from the previous call may be reused,
+run the kernel over every cell through a tensor iterator that dispatches to CPU threads or CUDA blocks, and hand
+back three things: the adjusted state in place, the gain matrix per cell, and a diagnostic per cell that encodes
+the iteration count or the reason for failure. `ThermoY` also accumulates a failure count, kept on the device of
+the cells so that a CUDA call never synchronises, which the host reads and resets when it chooses. This section is
+bookkeeping rather than physics, but it is the bookkeeping a dynamical core sees, and two failure modes a host can
+meet (a warm start reused across shapes, a failed cell that CUDA passes in silence) are decided here.
+
+::: {.callout-note title="At a glance"}
+**Purpose.** Run the per-cell kernels over a batch and report per cell; the diagnostic is
+@eq-ch04-drivers-diag, the warm-start rule @eq-ch04-drivers-warm.
+
+**Data.** In: the state tensors of @sec-ch04-equilibrate-tp or @sec-ch04-equilibrate-uv, any leading shape;
+out: the state in place, `gain` $(\dots, N_{\mathrm r}, N_{\mathrm r})$, `diag` $(\dots, 1)$, and for `ThermoY` the
+failure count $N_{\mathrm f}$ (count).
+
+**Placement.** The public saturation-adjustment call of either module; the hosts of @sec-ch14 call `ThermoY.forward`
+once per step.
+
+**Activation.** Always, when the card has nucleation reactions; the arguments `warm_start` (default off) and `diag`
+(default: allocated inside). No reactions: `forward` returns an undefined tensor and touches nothing.
+
+**Guarantee / limits.** The result does not depend on the warm start; the failure count equals the number of cells
+with `diag` $< 0$ since the last read; CUDA and CPU agree to summation order.
+
+**Evidence.** The Tests layer below: warm starts on a new shape and after a device move, the failure report on
+both devices, the gain support, the CUDA workspace.
+:::
+
+Local symbols: $d$ the diagnostic of a cell (`diag`); $s$ the status code and $n$ the number of outer passes of the
+kernel; $N_{\mathrm f}$ the failure count (`nfail_`); $\sigma$ the active-order permutation of the reactions
+(`reaction_set`) and $n_{\mathrm a}$ the number of active reactions (`nactive`); $w$ the per-cell workspace in bytes;
+$S_{\max}$ the dynamic shared memory a CUDA block may use and $B$ the threads per block. The code calls the saved
+pair "the warm start"; the dispatch functions are `call_equilibrate_tp` and `call_equilibrate_uv`.
+
+### Derivation
+
+There is no continuous equation in this section; the four identities below are the contracts the tests hold the
+drivers to, each with its check in `drivers_check.py`.
+
+**The diagnostic.** Each kernel writes one number per cell,
+$$
+d = \begin{cases} n & s = 0 \\ -(100\,s + n) & s \ne 0 \end{cases}, \qquad
+s \in \{1, 2, 4, 20\}, \qquad
+N_{\mathrm f} = \#\{\text{cells with } d < 0\},
+$$ {#eq-ch04-drivers-diag}
+with $s = 1$ for an invalid input (a non-positive temperature or pressure, a negative gas, no gas), $s = 2$ for a
+forced partition solve that did not converge (@sec-ch04-uv-partition), $s = 4$ for a failed constrained
+least-squares step, line search or caloric inversion, and $s = 20$ for the iteration cap; $n$ is capped at
+`max-iter`. @eq-ch04-drivers-diag is computed at the end of `equilibrate_tp`
+({{< code src/thermo/equilibrate_tp.h equilibrate_tp >}}) and `equilibrate_uv`
+({{< code src/thermo/equilibrate_uv.h equilibrate_uv >}}), and the count $N_{\mathrm f}$ in `ThermoYImpl::forward`
+({{< code src/thermo/thermo_y.cpp ThermoYImpl::forward >}}) as the number of negative entries of `diag`, added to
+the running total out of place so that a call under PyTorch's inference mode does not poison the next one. The
+decoding of a sample array, and the count, are `[C1]`. A cell that converged on its last allowed pass has
+$d = n =$ `max-iter` and counts as a success; a cell with an invalid input has $d = -100$. The kernel's
+`max_iter` argument is a per-cell copy that the kernel overwrites with $n$ unless the cap was hit, so the shared
+option is never modified.
+
+**The warm start.** The saved pair $(\sigma, n_{\mathrm a})$ is reused only when it is valid for the call:
+$$
+\begin{aligned}
+\text{reuse} \iff\ & \texttt{warm\_start} \wedge (\sigma, n_{\mathrm a})\ \text{defined} \wedge
+\text{device}(\sigma) = \text{device}(T) \\
+& \wedge \text{shape}(n_{\mathrm a}) = \text{shape}(T) \wedge
+\text{shape}(\sigma) = \text{shape}(T) \times N_{\mathrm r} ;
+\end{aligned}
+$$ {#eq-ch04-drivers-warm}
+otherwise the driver cold-starts with $\sigma$ the identity order and $n_{\mathrm a} = 0$ in every cell.
+@eq-ch04-drivers-warm is computed in `ThermoXImpl::forward` ({{< code src/thermo/thermo_x.cpp ThermoXImpl::forward >}})
+and `ThermoYImpl::forward` ({{< code src/thermo/thermo_y.cpp ThermoYImpl::forward >}}); the five cases of `[C2]`
+(same call, other shape, other device, warm start off, nothing saved) reuse the pair in exactly one. The saved
+tensors are plain members, not registered buffers, so `module.to(device)` leaves them behind, which is why the
+device is part of the test. The warm start changes the order in which the first pass tests the reactions and
+nothing else: the active set is rebuilt from the state on every pass (@sec-ch04-equilibrate-tp), so a warm and a
+cold start reach the same state, which is what the tests assert bit for bit.
+
+**The gain scatter.** Each kernel computes the gain of the active block in active order, an
+$n_{\mathrm a} \times n_{\mathrm a}$ matrix with leading dimension $n_{\mathrm a}$, and scatters it into the
+$N_{\mathrm r} \times N_{\mathrm r}$ output through $\sigma$:
+$$
+G^{\mathrm{out}}_{\sigma_k \sigma_l} = G^{\mathrm{block}}_{kl} \quad (k, l < n_{\mathrm a}), \qquad
+G^{\mathrm{out}}_{jm} = 0 \quad \text{otherwise},
+$$ {#eq-ch04-drivers-gain}
+so that the rows and columns of a reaction in equilibrium are zero and a solve that converges on its first pass
+(the common case, nothing supersaturated) returns a zero matrix. @eq-ch04-drivers-gain is computed at the end of
+`equilibrate_tp` ({{< code src/thermo/equilibrate_tp.h equilibrate_tp >}}) and `equilibrate_uv`
+({{< code src/thermo/equilibrate_uv.h equilibrate_uv >}}) after $n_{\mathrm a}$ has been recomputed at the final
+state; `[C3]` scatters a $2 \times 2$ block into three reactions. The `ThermoX` driver allocates the output with
+zeros and the `ThermoY` driver with `empty`, which is safe only because both kernels write every entry.
+
+**The workspace.** The per-cell kernels take their arrays from a bump allocator over a workspace whose size is a
+function of $N$ and $N_{\mathrm r}$ alone, each allocation rounded up to eight bytes:
+$$
+\begin{aligned}
+w_{\mathrm{tp}} &= 8\,(3N_{\mathrm r} + 2N_{\mathrm r}N + 2N + N_{\mathrm r}^2) + w_{\mathrm{kkt}}(N_{\mathrm r}, N), \\
+B &= \min\Bigl(32, \max\bigl(1, \lfloor S_{\max}/w \rfloor\bigr)\Bigr),
+\end{aligned}
+$$ {#eq-ch04-drivers-workspace}
+in double precision, where $w_{\mathrm{kkt}}$ is the budget of the constrained least-squares solver with
+$N_{\mathrm r}$ unknowns and $N$ bounds (@sec-ch10) and $B$ is the CUDA block size: each thread of a block owns
+$w$ bytes of dynamic shared memory, and the launcher shrinks the block until the block's total fits the device
+limit. @eq-ch04-drivers-workspace is computed in `equilibrate_tp_space`
+({{< code src/utils/alloc.h equilibrate_tp_space >}}), `equilibrate_uv_space`
+({{< code src/utils/alloc.h equilibrate_uv_space >}}) and `gpu_mem_kernel` ({{< code src/loops.cuh gpu_mem_kernel >}}).
+On CPU the workspace is the heap and $B$ plays no part. `[C4]` evaluates the budget for the eight vapour-cloud
+pairs of `test_cuda_workspace.py` ($N = 17$, $N_{\mathrm r} = 8$): $10.2\,\mathrm{KB}$ per cell for the fixed-$T$,
+fixed-$p$ kernel ($10.4\,\mathrm{KB}$ for the fixed-energy one) and $325\,\mathrm{KB}$ for a block of 32, which is
+the "about 10 KB" and "325 KB" of that test's description and more than any device allows, so the block shrinks. What is exact: all four identities are integer bookkeeping. The
+check is `drivers_check.py` (`[C1]` to `[C4]`).
+
+### Numerical method
+
+@fig-ch04-drivers-dataflow draws one call. The driver builds a tensor iterator over the cells with the species
+axis squashed, so that each iteration sees one cell's slice of every operand: three outputs (`gain`, `diag`, the
+state), the scalar inputs, and the saved pair as an input whose storage the kernel updates in place. On CPU the
+iterator's `for_each` runs the kernel over contiguous chunks of cells with a grain size of the cell count over the
+thread count ({{< code src/thermo/thermo_dispatch.cpp call_equilibrate_tp_cpu >}},
+{{< code src/thermo/thermo_dispatch.cpp call_equilibrate_uv_cpu >}}). On CUDA the same seven operands go to
+`gpu_mem_kernel` ({{< code src/loops.cuh gpu_mem_kernel >}}) with one thread per cell and the block size of
+@eq-ch04-drivers-workspace ({{< code src/thermo/thermo_dispatch.cu >}}); the curve and energy functions of the card
+are resolved to device function pointers before the launch, and the inline `ideal` and `antoine` curves are
+evaluated from their parameters inside the kernel (@sec-ch04-conditions). @sec-ch12 describes the launcher and the
+function tables.
+
+```{python}
+#| label: fig-ch04-drivers-dataflow
+#| fig-cap: "Data flow of one `forward` call. The state and the card's options enter the tensor iterator, which runs the per-cell kernel on CPU threads or CUDA blocks; the kernel adjusts the state in place and writes the gain and the diagnostic per cell. The saved active set (open box) enters only when it has the shape and device of the call (dashed vermillion test). `ThermoY` adds the number of negative diagnostics to its failure count (open box), on the device of the cells."
+#| fig-alt: "A flow diagram with input boxes on the left for the state, the options and the saved active set, a tensor iterator and a per-cell kernel box in the middle, and output boxes on the right for the adjusted state, the gain, the diagnostic and the failure count. A dashed arrow from the saved active set is labelled same shape and device."
+#| echo: false
+from kintera_report.ch04.figures.fig_drivers_dataflow import make_fig
+make_fig()
+```
+
+The `ThermoY` driver wraps the kernel with the conversions of @sec-ch03: partial densities from the density and
+mass fractions (`DY->V`), the starting temperature from the energy (`VU->T`), concentrations as partial densities
+over molar masses; and after the kernel, concentrations back to mass fractions (`V->Y`) copied into the caller's
+tensor. The temperature the kernel converged to is not kept: a host recovers it with `VU->T` from the adjusted
+state, which is exact for the baseline heat capacities. The failure count is a scalar tensor on the device of the
+cells; `take_saturation_adjustment_failures` copies it to the host, returns it and resets it, so that a host reads
+the count once per step without a synchronisation inside `forward`. On CPU the count is already on the host and
+the driver also issues a warning naming the number of cells, which is the only report a host that passes no `diag`
+gets; on CUDA there is no warning and the host must read the count.
+
+### Code
+
+| what | code link | symbol | switch |
+|---|---|---|---|
+| the mole-basis driver, @eq-ch04-drivers-warm | {{< code src/thermo/thermo_x.cpp ThermoXImpl::forward >}} | `ThermoXImpl::forward` | `warm_start`, `diag` |
+| the mass-basis driver, @eq-ch04-drivers-warm and $N_{\mathrm f}$ | {{< code src/thermo/thermo_y.cpp ThermoYImpl::forward >}} | `ThermoYImpl::forward` | `warm_start`, `diag` |
+| read and reset $N_{\mathrm f}$ | {{< code src/thermo/thermo_y.cpp ThermoYImpl::take_saturation_adjustment_failures >}} | `ThermoYImpl::take_saturation_adjustment_failures` | always |
+| the saved pair and the count | {{< code src/thermo/thermo.hpp ThermoYImpl::nfail_ >}} | `ThermoYImpl::nfail_` | always |
+| CPU dispatch, fixed $T$ and $p$ | {{< code src/thermo/thermo_dispatch.cpp call_equilibrate_tp_cpu >}} | `call_equilibrate_tp_cpu` | always |
+| CPU dispatch, fixed $U$ and $V$ | {{< code src/thermo/thermo_dispatch.cpp call_equilibrate_uv_cpu >}} | `call_equilibrate_uv_cpu` | always |
+| CUDA dispatch, both kernels | {{< code src/thermo/thermo_dispatch.cu >}} | `thermo_dispatch.cu` | CUDA build |
+| CUDA launcher, block size of @eq-ch04-drivers-workspace | {{< code src/loops.cuh gpu_mem_kernel >}} | `gpu_mem_kernel` | CUDA build |
+| workspace budgets | {{< code src/utils/alloc.h equilibrate_tp_space >}}, {{< code src/utils/alloc.h equilibrate_uv_space >}}, {{< code src/utils/alloc.h equilibrate_uv_partition_space >}} | `equilibrate_tp_space`, `equilibrate_uv_space`, `equilibrate_uv_partition_space` | always |
+| the diagnostic, @eq-ch04-drivers-diag, and the scatter, @eq-ch04-drivers-gain | {{< code src/thermo/equilibrate_tp.h equilibrate_tp >}}, {{< code src/thermo/equilibrate_uv.h equilibrate_uv >}} | `equilibrate_tp`, `equilibrate_uv` | always |
+| Python binding | {{< code python/csrc/pythermo.cpp bind_thermo >}} | `bind_thermo` | always |
+
+: Code map of the batched drivers. {#tbl-ch04-drivers-code}
+
+Walk-through of a `ThermoY.forward(rho, intEng, yfrac, warm_start, diag)` call
+({{< code src/thermo/thermo_y.cpp ThermoYImpl::forward >}}):
+
+1. No reactions: return an undefined tensor (Python `None`), the state untouched.
+2. `DY->V`, allocation of `gain` $(\dots, N_{\mathrm r}^2)$; the test of @eq-ch04-drivers-warm, and a cold start
+   when it fails; `diag` allocated with zeros unless given.
+3. `VU->T` and `VT->P` for the starting temperature; concentrations from the partial densities.
+4. The tensor iterator; the solver code from `uv-solver` (`Invalid UV solver` for any other string,
+   `UV partition solver requires disjoint vapor-cloud reactions` for a forced partition on an ineligible card,
+   @sec-ch04-uv-partition); the curve kinds and parameters; the dispatch with the energy offsets and heat
+   capacities per mole.
+5. $N_{\mathrm f}$ updated from `diag`; the CPU warning `saturation adjustment failed in <n> cell(s)`.
+6. `V->Y` back into `yfrac`; `gain` returned as $(\dots, N_{\mathrm r}, N_{\mathrm r})$.
+
+`ThermoX.forward(temp, pres, xfrac, warm_start, diag)` ({{< code src/thermo/thermo_x.cpp ThermoXImpl::forward >}})
+runs steps 1, 2, 4 and 6 without the conversions and without the count; its `diag` is allocated uninitialised
+when not given, which the kernel overwrites in every cell. `reset` of either module
+({{< code src/thermo/thermo_y.cpp ThermoYImpl::reset >}}) drops the count, so a cloned module starts at zero and
+the original keeps its own. In Python, the host sequence with the failure report:
+
+```python
+gain = ty.forward(rho, intEng, yfrac)             # no diag: CPU warns, CUDA is silent
+nfail = ty.take_saturation_adjustment_failures()  # one host copy; resets the count
+diag = torch.zeros(rho.shape + (1,), dtype=rho.dtype, device=rho.device)
+gain = ty.forward(rho, intEng, yfrac, True, diag)  # warm start
+status = (-diag[diag < 0]) // 100                  # 1, 2, 4 or 20 per failed cell
+```
+
+### Tests
+
+| test (ctest name) | what it asserts | tolerance | where the tolerance comes from |
+|---|---|---|---|
+| `tests/test_warm_start_shape.py` (`test_warm_start_shape.py`), `test_warm_start_on_a_new_shape`, `test_warm_start_after_device_move` | `ThermoY`: a warm start on an $8^3$ batch after a one-cell call, and on the same shape after `.to(cuda)` and back, equals a cold start | exact | the same arithmetic in the same order |
+| `tests/test_thermo_x_warm_start_shape.py` (`test_thermo_x_warm_start_shape.py`), `test_warm_start_on_a_larger_batch`, `test_warm_start_after_device_move` | `ThermoX`: the same two claims, after priming two different active sets | exact (`atol` 0) | the same arithmetic |
+| `tests/test_saturation_failure_reported.py` (`test_saturation_failure_reported.py`), `test_unadjusted_cell_is_reported` | `max-iter` 1 on a $150\times$ supersaturated cell gives `diag` $< 0$; the count reads 1 then 0; without `diag`, CPU warns and CUDA does not, and both count 1 | exact | integer count |
+| `tests/test_saturation_failure_reported.py` (`test_saturation_failure_reported.py`), `test_inference_mode_does_not_poison_later_forwards`, `test_clone_does_not_share_the_failure_count` | a call under inference mode followed by a plain call counts 2; a clone keeps its own count (original 2, clone 1) | exact | integer count |
+| `tests/test_equilibrate_uv_gain.py` (`test_equilibrate_uv_gain.py`) | @eq-ch04-drivers-gain: zero rows and columns for the inactive reaction, a zero matrix after a converged warm start | exact zero | the scatter writes nothing elsewhere |
+| `tests/test_cuda_workspace.py` (`test_cuda_workspace.py`) | eight pairs, 200 cells: the block shrinks instead of refusing, and CUDA equals CPU for `forward` of both modules and both `uv-solver` settings | rtol $10^{-10}$, atol $10^{-14}$ | summation order |
+| `tests/test_alloc_space.cpp` (`test_alloc_space`), `equilibrate_uv_stays_in_budget` of the `AllocSpaceTest` suite | the kernel on a guarded pool of exactly `equilibrate_uv_space` bytes writes nothing past it, for 1 to 5 pairs, both solver codes, float and double | exact (canary bytes) | memory check |
+| `tests/test_thermo.cpp` (`test_thermo`), `DeviceTest.equilibrate_tp_batch`, `DeviceTest.equilibrate_uv_batch` | a $2 \times 3 \times 17$ domain (102 cells, three leading dimensions), CPU and CUDA, float and double: mole fractions still sum to one, energy closed | `allclose`, $10^{-4}$ | set in the test |
+| `tests/test_thermo_default_nucleation.py`, `tests/test_thermo_none_nucleation.py`, `tests/test_thermo_none_nucleation_after_reset.py`, `tests/test_thermo_y_none_nucleation.py` (`test_python_subprocess`) | modules built without reactions, or with the nucleation options set to `None` after construction, do not crash and give the empty default | exact | crash probe |
+| `src/kintera_report/ch04/checks/drivers_check.py` | the decoding and the count; the reuse cases; the scatter; the workspace budget | exact | integer bookkeeping |
+
+: Tests of the batched drivers. {#tbl-ch04-drivers-tests}
+
+The warm-start, failure-report and CUDA-workspace files passed in the recorded CPU and CUDA
+run;[^ch04-drivers-cuda] the gain test in the recorded CPU run;[^ch04-drivers-cpu] the `DeviceTest` batch cases in
+the recorded CUDA-build run;[^ch04-drivers-run] and `test_alloc_space` with the four nucleation-option files in a
+separate run on the same build.[^ch04-drivers-alloc] Covered on CUDA as well as CPU: every file above except the
+gain test, which runs on CPU only. Not measured by any test: the cost of the host copy in
+`take_saturation_adjustment_failures` and the block size the launcher chooses on a given device.
+
+[^ch04-drivers-cuda]: [sha: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45; deck: the cards each test
+    writes; run: `PYTHONPATH=<install-dir> pytest tests/test_cuda_workspace.py tests/test_reaction_equilibrium.py tests/test_warm_start_shape.py tests/test_thermo_x_warm_start_shape.py tests/test_saturation_failure_reported.py`,
+    CPU and CUDA (one RTX 5090), float and double; 135 passed; Python 3.11.13, torch 2.10.0+cu128, numpy 2.4.6]
+
+[^ch04-drivers-cpu]: [sha: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45; deck: the cards each test
+    writes; run: `PYTHONPATH=<install-dir> pytest tests/test_equilibrium.py tests/test_nasa9_cp.py tests/test_h2_cp.py tests/test_inline_svp.py tests/test_equilibrate_uv_gain.py tests/test_latent_heat_sign.py tests/test_saturation_adjustment_nh4sh.py tests/test_saturation_degenerate_bound.py tests/test_effective_cp_heap_state.py tests/test_earth.py tests/test_reference_state_keys.py`,
+    CPU, double; 47 passed; Python 3.11.13, torch 2.10.0+cu128, numpy 2.4.6]
+
+[^ch04-drivers-run]: [sha: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45; deck: `tests/jupiter.yaml`,
+    `tests/earth.yaml`; run: `ctest -R 'test_thermo|test_equilibrate_tp_max_iter' -V` in the `tests/` directory of a
+    CUDA build (`cmake -DCUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120`), CPU and CUDA (one RTX 5090), float and double;
+    `test_thermo` 66 passed, 8 skipped; gcc 11.5.0, CUDA 12.9, cmake 3.31.8, libtorch of torch 2.10.0+cu128]
+
+[^ch04-drivers-alloc]: [sha: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45; deck: the states and cards the
+    tests build; run: `ctest -R test_alloc_space -V` in the `tests/` directory of the same CUDA build, then
+    `PYTHONPATH=<install-dir> pytest tests/test_thermo_default_nucleation.py tests/test_thermo_none_nucleation.py tests/test_thermo_none_nucleation_after_reset.py tests/test_thermo_y_none_nucleation.py`,
+    CPU and CUDA (one RTX 5090), float and double for the C++ cases; `test_alloc_space` 6 passed; 16 passed;
+    gcc 11.5.0, CUDA 12.9, Python 3.11.13, torch 2.10.0+cu128, numpy 2.4.6]
+
+### Limits
+
+::: {.callout-warning title="Limits"}
+- A host that passes no `diag` and does not read the failure count sees nothing on CUDA; on CPU it sees one
+  warning per call with a count and no cell index.
+- The saved active set is per module and per shape: a host that calls `forward` on alternating shapes (a column,
+  then the domain) cold-starts every time, which is correct and costs at most the reordering of the first pass.
+- `module.to(device)` leaves the saved pair and the count behind; the next `forward` on the new device rebuilds
+  the pair and starts a new count, and a count accumulated before the move is lost unless read first.
+- The block size on CUDA follows the workspace alone; a card with many condensables runs with few threads per
+  block, and the launcher refuses when one cell's workspace exceeds the device limit. Not measured beyond eight
+  pairs.
+- The `ThermoY` driver recomputes the pressure (`VT->P`) and discards it; the documented caching of the
+  equilibrium temperature and pressure in the module's buffers is not implemented at the pin, and a host must
+  recover both from the adjusted state.
+- No test exercises `forward` on a non-contiguous state or on a batch with more than three leading dimensions.
+:::

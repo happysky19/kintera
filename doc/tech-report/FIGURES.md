@@ -21,3 +21,14 @@ Regenerate every figure: `python3 tools/render_figures.py` (to `build/figures/<c
 | `fig-ch03-reference-state-offsets` | `03-thermodynamics/_reference-state.qmd` | `kintera_report/ch03/figures/fig_reference_state_offsets.py` | - |
 | `fig-ch03-relative-humidity-quotient` | `03-thermodynamics/_relative-humidity.qmd` | `kintera_report/ch03/figures/fig_relative_humidity_quotient.py` | - |
 | `fig-ch03-species-state-layout` | `03-thermodynamics/_species-state.qmd` | `kintera_report/ch03/figures/fig_species_state_layout.py` | - |
+
+## ch04
+
+| figure | section file | code | data (written by) |
+|---|---|---|---|
+| `fig-ch04-conditions-complementarity` | `04-phase-equilibrium/_conditions.qmd` | `kintera_report/ch04/figures/fig_conditions_complementarity.py` | - |
+| `fig-ch04-depmap` | `04-phase-equilibrium.qmd` | `kintera_report/ch04/figures/fig_ch04_depmap.py` | - |
+| `fig-ch04-drivers-dataflow` | `04-phase-equilibrium/_drivers.qmd` | `kintera_report/ch04/figures/fig_drivers_dataflow.py` | - |
+| `fig-ch04-equilibrate-tp-convergence` | `04-phase-equilibrium/_equilibrate-tp.qmd` | `kintera_report/ch04/figures/fig_equilibrate_tp_convergence.py` | `src/kintera_report/ch04/data/equilibrate_tp_history.json` (`kintera_report/ch04/checks/equilibrate_tp_check.py`) |
+| `fig-ch04-equilibrate-uv-convergence` | `04-phase-equilibrium/_equilibrate-uv.qmd` | `kintera_report/ch04/figures/fig_equilibrate_uv_convergence.py` | `src/kintera_report/ch04/data/equilibrate_uv_history.json` (`kintera_report/ch04/checks/equilibrate_uv_check.py`) |
+| `fig-ch04-uv-partition-energy` | `04-phase-equilibrium/_uv-partition.qmd` | `kintera_report/ch04/figures/fig_uv_partition_energy.py` | `src/kintera_report/ch04/data/uv_partition_energy.json` (`kintera_report/ch04/checks/uv_partition_check.py`) |
