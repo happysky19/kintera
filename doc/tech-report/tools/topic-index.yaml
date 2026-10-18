@@ -77,8 +77,35 @@ sections:
     - effective heat capacity, with the latent term: [effective_cp]
     - pseudo-adiabat, rain-out: [rainout]
 
+  # Chapter 4. Phase equilibrium of multiple condensables
+  sec-ch04-conditions:
+    - saturation condition, equality with a cloud and inequality without
+    - phase-change reaction: [nucleation, 'type: nucleation']
+    - saturation quotient, logarithm: [logsvp, rate-constant]
+    - complementarity, phase presence
+  sec-ch04-equilibrate-tp:
+    - saturation adjustment, fixed temperature and pressure: [ThermoX.forward, equilibrate_tp]
+    - active set, of reactions
+    - extent limiter, reactant stock
+    - gain matrix: [gain]
+  sec-ch04-equilibrate-uv:
+    - saturation adjustment, fixed energy and volume: [ThermoY.forward, equilibrate_uv, uv-solver]
+    - energy coupling, of the saturation residual
+    - caloric inversion, after a composition step
+  sec-ch04-uv-partition:
+    - partition solver, disjoint vapour-cloud pairs: ['uv-solver: partition', 'uv-solver: auto']
+    - inventory, of a vapour-cloud pair
+  sec-ch04-drivers:
+    - warm start: [warm_start, reaction_set, nactive]
+    - diagnostic code of the saturation adjustment: [diag]
+    - failure count, saturation adjustment: [take_saturation_adjustment_failures]
+    - dispatch, CPU and CUDA kernels of the saturation adjustment
+
 unlabeled:
   # the per-chapter fragments of Appendix B carry the chapter title as an unlabelled `##` heading (gen_derivation_index.py)
   - file: chapters/appendices/_appb-ch03.qmd
     heading: Equation of state and thermodynamic functions (@sec-ch03)
+    covered-by: sec-appb
+  - file: chapters/appendices/_appb-ch04.qmd
+    heading: Phase equilibrium of multiple condensables (@sec-ch04)
     covered-by: sec-appb
