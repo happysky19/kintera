@@ -1,0 +1,6 @@
+[C1] PASS NASA-9: d(h/R)/dT - cp/R simplifies to 0
+[C2] PASS NASA-9 u/R(T0) - baseline = 0.0e+00; max |dU/dT / (cp/R - 1) - 1| = 4.6e-10 (tolerance 1e-7); cp/R(H2, 300 K) = 3.4697
+[C3] PASS H2 cp/R: equilibrium 50 K 4.5684, equilibrium 300 K 3.4526, normal 20 K 2.5000, normal 50 K 2.5038, normal 300 K 3.4523; max |got - pinned| = 5.0e-05 (tolerance 2e-3)
+[C4] PASS H2: max |de/dT / cv - 1| = 7.5e-11 (tolerance 1e-6); cp/R(1000 K) = 3.50018 (classical 3.5)
+[C5] PASS cp/R - cv/R = [1.0, 1.0, 0.0] for (dry, H2O, H2O(l))
+caloric_check: 5 of 5 passed

@@ -1,0 +1,6 @@
+[C1] PASS single-reaction gain G = -x_d/(x_v*(x_d + x_v)) = 1/x_g - 1/x_v
+[C2] PASS c_p,latent = L_p*l*x_g*x_v/(x_g - x_v); dilute limit per x_v = l**2/(R*T**2)
+[C3] PASS 290 K, 1 bar: x_v = 0.01921, l = 31470 J mol^-1, c_p,normal = 29.101, c_p,latent = 39.146 J mol^-1 K^-1 (ratio 1.345)
+[C4] PASS entropy Newton: |ds| 2.896e-01 -> 1.450e-03 J mol^-1 K^-1 after one step (predicted remainder e0^2/(2 c_p) = 1.441e-03); T = 291.089167 K (exact dry adiabat 291.103674 K)
+[C5] PASS rain-out target: no cloud -> 150.0 (= s_0); with cloud 151.459 (lowered by 0.120)
+adiabat_check: 5 of 5 passed

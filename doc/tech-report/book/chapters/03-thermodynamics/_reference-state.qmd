@@ -1,0 +1,205 @@
+## The reference state and the latent heat (`reference-state`) {#sec-ch03-reference-state}
+
+<!-- PROVENANCE
+pin: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45 (main)
+sources: src/thermo/thermo.hpp, src/thermo/thermo_y.cpp, src/thermo/thermo_x.cpp, src/thermo/thermo_options.cpp, src/species.cpp, src/vapors/vapor_functions.h, docs/h2o_bryan_latent_heat.md, examples/jupiter_kcl_mgsio3.yaml, tests/jupiter.yaml, tests/test_latent_heat_sign.py, tests/test_reference_state_keys.py
+status: draft
+author: Tianhao Le (happysky19)
+reviewer: Linfeng (requested)
+-->
+
+### Summary
+
+The caloric data of a card are given at a reference state: `u0_R` is the internal energy over $\mathcal R$ of a
+species at the reference temperature `Tref`, and `s0_R` its entropy over $\mathcal R$ at `Tref` and the reference
+pressure `Pref`. The latent heat of a phase change is not a separate input; it is the difference of the `u0_R`
+values of vapour and condensate, and it must be positive for condensation to release energy. This section explains
+how the offsets are shifted once, at construction, to $T = 0$ and to $T = 1\,\mathrm K$, $p = 1\,\mathrm{Pa}$ so that
+every later formula is offset-free, why the card is warned about an endothermic condensate, and how the offsets have
+to agree with the saturation curve of @sec-ch04 through the Clausius-Clapeyron relation.
+
+::: {.callout-note title="At a glance"}
+**Purpose.** Fix $u^\star_i$ and $s^\star_i$ from the card, @eq-ch03-reference-state-shift, and the latent heat
+$\ell_j = -\sum_i \nu_{ij} u^\star_i$ that follows.
+
+**Data.** `reference-state: {Tref, Pref}` [K, Pa] and per species `u0_R` [K], `s0_R` [-], `cv_R` [-]; in memory
+`uref_R`, `sref_R`, `cref_R` after the shift.
+
+**Placement.** Once, in `ThermoY::reset` or `ThermoX::reset`; guarded by the flag `offset_zero` so a cloned options
+object is not shifted twice.
+
+**Activation.** Always; defaults `Tref` $300\,\mathrm K$, `Pref` $10^5\,\mathrm{Pa}$, `u0_R` $0$, `s0_R` $0$. An
+unknown key in `reference-state` is refused with a suggestion.
+
+**Guarantee / limits.** The shift leaves $u_i(T)$ and $s_i(T, p)$ unchanged (exact algebra); a latent heat
+$\le 0$ at `Tref` only warns.
+
+**Evidence.** The Tests layer below: `test_latent_heat_sign.py`, `test_reference_state_keys.py`.
+:::
+
+Local symbols: $T_\star$ and $p_\star$ the reference temperature and pressure (`Tref`, `Pref`); $u^\star_i$ and
+$s^\star_i$ the stored offsets (`uref_R`, `sref_R`, as $u^\star_i/\mathcal R$ in K and $s^\star_i/\mathcal R$);
+$\nu_{ij}$ the stoichiometric coefficient of species $i$ in reaction $j$, positive for products (`stoich`);
+$\ell_j$ the molar latent heat of reaction $j$ [$\mathrm{J\,mol^{-1}}$]; for the saturation curve the fit
+parameters $\beta$, $\delta$, $T_r$, $p_r$ of the `ideal` form (@sec-ch04). The star marks the reference
+state as the shared notation requires; the internal flag is `offset_zero`.
+
+### Derivation
+
+The card gives, per species, $\hat u_i(T_\star) =$ `u0_R` and $\hat s_i(T_\star, p_\star) =$ `s0_R` together with the
+constant $\hat c_{v,i} =$ `cv_R`. With the baseline of @sec-ch03-caloric the energy at any temperature is
+$\hat u_i(T) = \texttt{u0\_R} + \hat c_{v,i}(T - T_\star)$, and the entropy of a gas at any $(T, p)$ is
+$\hat s_i = \texttt{s0\_R} + (\hat c_{v,i} + 1)\ln(T/T_\star) - \ln(p/p_\star)$. Collecting the constants gives the
+offsets the code stores,
+$$
+\begin{aligned}
+\frac{u^\star_i}{\mathcal R} &= \texttt{u0\_R}_i - \hat c_{v,i}\,T_\star \quad \text{all species}, \\
+\frac{s^\star_i}{\mathcal R} &= \texttt{s0\_R}_i - (\hat c_{v,i} + 1)\ln\max(T_\star, 1) + \ln\max(p_\star, 1) \quad (i < N_{\mathrm g}), \\
+\frac{s^\star_i}{\mathcal R} &= 0 \quad (i \ge N_{\mathrm g}),
+\end{aligned}
+$$ {#eq-ch03-reference-state-shift}
+after which $\hat u_i(T) = u^\star_i/\mathcal R + \hat c_{v,i} T$ and $\hat s_i = s^\star_i/\mathcal R + (\hat c_{v,i}+1)\ln T - \ln p$
+are the same functions as before (`[C1]`, `[C2]` of `reference_state_check.py`). @eq-ch03-reference-state-shift is
+computed in `ThermoYImpl::reset` ({{< code src/thermo/thermo_y.cpp ThermoYImpl::reset >}}) and identically in
+`ThermoXImpl::reset` ({{< code src/thermo/thermo_x.cpp ThermoXImpl::reset >}}). The clamps to $1$ let a card say
+`Tref: 0.` (several test cards do) and mean "the offsets are already at $T = 0$", because $\ln 1 = 0$. The condensate
+entropy offsets are set to zero because @sec-ch03-entropy derives the condensate entropy from the saturation curve
+and never reads them. The flag `offset_zero` records that the shift has happened, so an options object shared by a
+`ThermoX` and a `ThermoY`, or cloned, is shifted once.
+
+The latent heat of reaction $j$ at the reference temperature is the energy released when the reaction proceeds by
+one mole of extent, $\ell_j(T_\star) = -\mathcal R\sum_i \nu_{ij}\,\texttt{u0\_R}_i$, since $\nu_{ij} < 0$ for the
+vapour consumed and $> 0$ for the condensate formed. The card loader evaluates this sum for every nucleation
+reaction and warns when it is not positive:
+$$
+\ell_j(T_\star) = \mathcal R \Bigl(\sum_{i\,\in\,\mathrm{reactants}} |\nu_{ij}|\,\texttt{u0\_R}_i - \sum_{i\,\in\,\mathrm{products}} \nu_{ij}\,\texttt{u0\_R}_i\Bigr) \le 0
+\;\Rightarrow\; \text{warning},
+$$ {#eq-ch03-reference-state-latent}
+and @eq-ch03-reference-state-latent is computed in `ThermoOptionsImpl::from_yaml`
+({{< code src/thermo/thermo_options.cpp ThermoOptionsImpl::from_yaml overload=2 >}}). For `tests/jupiter.yaml`,
+$\mathrm{H_2O} \rightleftharpoons \mathrm{H_2O(l)}$ has $\texttt{u0\_R} = 0$ and $-3430\,\mathrm K$, so
+$\ell/\mathcal R = 3430\,\mathrm K$ ($28.5\,\mathrm{kJ\,mol^{-1}}$); a condensate without `u0_R` gives $0$ and the
+warning (`[C3]`).
+
+The offsets are not free: they must agree with the saturation curve that @sec-ch04 uses, or the energy released by
+condensation in the fixed-energy solver will not match the temperature dependence of the curve. For the `ideal`
+curve $\ln p_{\mathrm{sat}} = \ln p_r + \beta(1 - T_r/T) - \delta\ln(T/T_r)$ and an ideal vapour over a condensate of
+negligible volume, the Clausius-Clapeyron relation $\ell = \mathcal R T^2\,\mathrm d\ln p_{\mathrm{sat}}/\mathrm dT$ gives
+$$
+\ell(T) = \mathcal R\,(\beta T_r - \delta T),
+$$ {#eq-ch03-reference-state-kirchhoff}
+linear in $T$ with slope $-\mathcal R\delta = c_{p,v} - c_{c}$: the Kirchhoff form (`[C4]`). With the baseline
+enthalpies $\hat h_v - \hat h_c = (u^\star_v - u^\star_c)/\mathcal R + (\hat c_{v,v} + 1 - \hat c_{v,c})\,T$, a
+consistent card therefore has $\delta = \hat c_{v,c} - \hat c_{v,v} - 1$ and $\beta T_r = (u^\star_v - u^\star_c)/\mathcal R$.
+The Jupiter test card uses the `h2o_ideal` constants ($\beta = 24.845$, $T_r = 273.16\,\mathrm K$, $\delta = 4.986$)
+with $\hat c_{v,c} - \hat c_{v,v} - 1 = 9 - 2.5 - 1 = 5.5$ and $(u^\star_v - u^\star_c)/\mathcal R = 5380\,\mathrm K$
+against $\beta T_r = 6787\,\mathrm K$: it is *not* Kirchhoff-consistent, and its moist adiabats carry that
+inconsistency (@sec-ch03-adiabat). Two cards in the tree are consistent by construction: `h2o_bryan`, whose $\beta$
+is chosen so that $\ell(273.15\,\mathrm K) = 2.5\times10^6\,\mathrm{J\,kg^{-1}}$ (`[C5]`, reproducing the literal
+$24.815845$ of {{< code src/vapors/vapor_functions.h h2o_bryan >}}), and `examples/jupiter_kcl_mgsio3.yaml`, whose
+`u0_R` values are $-B\ln 10$ for curves of the form $\ln(10)(A - B/T)$ with $\Delta c_p = 0$ (`[C6]`). The check
+`reference_state_check.py` holds all six statements.
+
+### Numerical method
+
+There is no discretisation in this section; @fig-ch03-reference-state-offsets shows what the shift does to the two
+energy lines of water in the Jupiter card. The order of operations at construction is: read the card, form the
+species groups (@sec-ch03-species-state), copy `cv_R`, `u0_R`, `s0_R` into `cref_R`, `uref_R`, `sref_R` in group
+order, then shift once in `reset`. A `ThermoY` and a `ThermoX` built from the same options object share the shifted
+arrays. The latent-heat sum is evaluated on the *unshifted* `u0_R`, which is the same as on the shifted $u^\star_i$
+only when the heat capacities of vapour and condensate are equal; the warning therefore tests the latent heat at
+$T_\star$, as its message says.
+
+```{python}
+#| label: fig-ch03-reference-state-offsets
+#| fig-cap: "Molar internal energy over the gas constant of water vapour (blue) and liquid water (dashed green) with the constant heat capacities of the Jupiter test card. The card gives the offsets at the reference temperature of 300 K (circles; the vertical vermillion bar is the latent heat there, 3430 K); the code stores the intercepts at zero temperature (squares), which are the same two lines."
+#| fig-alt: "Two straight lines of internal energy against temperature from 0 to 400 K: the vapour line with slope 2.5 passing through zero at 300 K, and the steeper liquid line with slope 9 passing through minus 3430 K at 300 K. Markers show the intercepts at zero temperature, minus 750 K and minus 6130 K, and a vertical bar at 300 K marks the gap of 3430 K between the lines."
+#| echo: false
+from kintera_report.ch03.figures.fig_reference_state_offsets import make_fig
+make_fig()
+```
+
+### Code
+
+| what | code link | symbol | switch |
+|---|---|---|---|
+| `Tref`, `Pref` and the flag switches | {{< code src/thermo/thermo_options.cpp ThermoOptionsImpl::from_yaml overload=2 >}} | `ThermoOptionsImpl::from_yaml` | `reference-state` |
+| allowed keys of the block | {{< code src/species.cpp check_reference_state >}} | `check_reference_state` | always |
+| defaults $300\,\mathrm K$, $10^5\,\mathrm{Pa}$ | {{< code src/thermo/thermo.hpp ThermoOptionsImpl::Tref >}} | `ThermoOptionsImpl::Tref` | always |
+| per-species `u0_R`, `s0_R`, `cv_R` | {{< code src/species.cpp init_species_from_yaml overload=2 >}} | `init_species_from_yaml` | always |
+| the shift, @eq-ch03-reference-state-shift | {{< code src/thermo/thermo_y.cpp ThermoYImpl::reset >}} | `ThermoYImpl::reset` | `offset_zero` |
+| the shift in the mole basis | {{< code src/thermo/thermo_x.cpp ThermoXImpl::reset >}} | `ThermoXImpl::reset` | `offset_zero` |
+| once-only flag | {{< code src/thermo/thermo.hpp ThermoOptionsImpl::offset_zero >}} | `ThermoOptionsImpl::offset_zero` | always |
+| latent-heat warning, @eq-ch03-reference-state-latent | {{< code src/thermo/thermo_options.cpp ThermoOptionsImpl::from_yaml overload=2 >}} | `ThermoOptionsImpl::from_yaml` | always |
+| the benchmark water curve | {{< code src/vapors/vapor_functions.h h2o_bryan >}} | `h2o_bryan` | `formula: h2o_bryan` |
+
+: Code map of the reference state. {#tbl-ch03-reference-state-code}
+
+Walk-through:
+
+1. `check_reference_state` ({{< code src/species.cpp check_reference_state >}}) accepts an empty block (defaults
+   kept), refuses a list or a scalar (`must be a map of key: value pairs`) and refuses any key outside `Tref`,
+   `Pref`, `use-nasa9-cp`, `use-h2-cp`, `h2-cp-mode`, naming the closest one (`did you mean`).
+2. `ThermoOptionsImpl::from_yaml` returns a null options object when the block is absent altogether: a card without
+   `reference-state` has no thermodynamics.
+3. After the reactions are registered, the latent-heat loop warns per reaction with the text `has latent heat ... K <= 0
+   at Tref, i.e. condensation absorbs energy. Set u0_R (u/R at Tref) on the condensate`.
+4. `reset` of either module shifts once and prints the shifted arrays when `verbose` is on.
+
+A card fragment that satisfies all of the above and is Kirchhoff-consistent with its curve (a YAML card; the fence
+is left untyped until the key registry of the glossary carries these keys):
+
+```text
+reference-state: {Tref: 0., Pref: 1.e5}
+species:
+  - {name: dry, composition: {N: 1.56, O: 0.42}, cv_R: 2.5}
+  - {name: H2O, composition: {H: 2, O: 1}, cv_R: 2.5, u0_R: 0.}
+  - {name: H2O(l), composition: {H: 2, O: 1}, cv_R: 8.486009, u0_R: -6786.66}
+reactions:
+  - {equation: H2O <=> H2O(l), type: nucleation, rate-constant: {formula: h2o_bryan}}
+```
+
+Here $\hat c_{v,c} - \hat c_{v,v} - 1 = 4.986009 = \delta$ and $u^\star_v - u^\star_c = 6786.66\,\mathrm K \approx \beta T_r
+= 24.815845 \times 273.16\,\mathrm K$, as @eq-ch03-reference-state-kirchhoff requires.
+
+### Tests
+
+| test (ctest name) | what it asserts | tolerance | where the tolerance comes from |
+|---|---|---|---|
+| `tests/test_latent_heat_sign.py` (`test_python_subprocess`), `test_endothermic_condensate_is_reported` | a condensate without `u0_R` produces the warning text on standard error | exact text | exact |
+| `tests/test_latent_heat_sign.py` (`test_python_subprocess`), `test_physical_condensate_is_silent` | `u0_R: -3430.` produces no warning | exact | exact |
+| `tests/test_reference_state_keys.py` (`test_reference_state_keys.py`) | typo keys refused with a suggestion; valid keys accepted; list or scalar block refused; empty block keeps `Tref` $> 0$ | exact text | exact |
+| `tests/test_vapor_functions.cpp` (`test_vapor_functions`) | the `h2o_bryan` values at four temperatures | as listed in the test | the constant $24.815845$ pins them |
+| `src/kintera_report/ch03/checks/reference_state_check.py` | the shift identities; the Kirchhoff form; $\beta$ of `h2o_bryan`; the deep-Jupiter card's `u0_R` | symbolic; $10^{-7}$; $10^{-9}$ | algebra; digits of the literals |
+
+: Tests of the reference state. {#tbl-ch03-reference-state-tests}
+
+The two Python files passed in the recorded CPU run,[^ch03-reference-state-pyrun] `test_vapor_functions` passed in the
+recorded CUDA-build run.[^ch03-reference-state-run] The check reproduces $\beta = 24.815845125$ from
+$L_{v0} = 2.5\times10^6\,\mathrm{J\,kg^{-1}}$, $R_v = 461.5298\,\mathrm{J\,kg^{-1}\,K^{-1}}$ and $\delta = 4.986009$,
+and the card literals $-26208.0235\,\mathrm K$ and $-114887.4832\,\mathrm K$ from $-B\ln 10$ (`[C5]`, `[C6]`). No test
+checks the shift identities @eq-ch03-reference-state-shift on their own; they are covered indirectly by every
+energy round trip of @sec-ch03-caloric.
+
+[^ch03-reference-state-pyrun]: [sha: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45; deck: the cards each test
+    writes; run: `PYTHONPATH=<install-dir> pytest tests/test_equilibrium.py tests/test_nasa9_cp.py tests/test_h2_cp.py tests/test_inline_svp.py tests/test_equilibrate_uv_gain.py tests/test_latent_heat_sign.py tests/test_saturation_adjustment_nh4sh.py tests/test_saturation_degenerate_bound.py tests/test_effective_cp_heap_state.py tests/test_earth.py tests/test_reference_state_keys.py`,
+    CPU, double; 47 passed; Python 3.11.13, torch 2.10.0+cu128, numpy 2.4.6]
+
+[^ch03-reference-state-run]: [sha: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45; deck: none (literal inputs);
+    run: `ctest -R 'test_thermo|test_vapor_functions|test_equilibrate_tp_max_iter|test_equilibrium.release|test_species|test_reaction'`
+    in the `tests/` directory of a CUDA build (`cmake -DCUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120`), CPU and CUDA (one
+    RTX 5090); 6 of 6 binaries passed; gcc 11.5.0, CUDA 12.9, cmake 3.31.8, libtorch of torch 2.10.0+cu128]
+
+### Limits
+
+::: {.callout-warning title="Limits"}
+- The Kirchhoff consistency of @eq-ch03-reference-state-kirchhoff is not checked at load. `tests/jupiter.yaml`
+  violates it by about $20\,\%$ in $\beta T_r$, and nothing warns; the fixed-energy solver of @sec-ch04
+  then releases the card's latent heat while the saturation curve moves with the fit's, so the equilibrium
+  temperature it reaches is that of an inconsistent substance. Not measured: the temperature error this causes.
+- The latent-heat warning is a warning, not an error, and is evaluated at `Tref` only; a latent heat that changes
+  sign at another temperature (large $\delta$) is not reported.
+- `s0_R` of a condensate is read and then zeroed; a card that sets it has no effect.
+- The entropy offsets are shifted only for gases, with `Tref` and `Pref` clamped to $1$; a card with
+  $0 < T_\star < 1\,\mathrm K$ is shifted as if $T_\star = 1\,\mathrm K$, silently.
+:::

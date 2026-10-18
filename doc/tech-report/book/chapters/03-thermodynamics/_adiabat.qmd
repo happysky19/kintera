@@ -1,0 +1,228 @@
+## Moist adiabatic extrapolation and the effective heat capacity (`extrapolate_dlnp`, `extrapolate_dz`) {#sec-ch03-adiabat}
+
+<!-- PROVENANCE
+pin: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45 (main)
+sources: src/thermo/extrapolate_ad.cpp, src/thermo/thermo.hpp, src/thermo/thermo_x.cpp, src/thermo/eval_uhs.cpp, python/csrc/pythermo.cpp, examples/example_earth.py, examples/example_jupiter_adiabat.py, examples/jupiter_kcl_mgsio3.yaml, tests/test_thermo.cpp, tests/test_effective_cp_heap_state.py, tests/test_jupiter_tp_adiabat.py
+status: draft
+author: Tianhao Le (happysky19)
+reviewer: Linfeng (requested)
+-->
+
+### Summary
+
+A parcel that rises adiabatically cools, and when it is saturated part of the cooling is offset by the latent heat of
+the condensate it forms. kintera builds such a profile one step at a time: given an equilibrated state at one
+pressure (or height), `ThermoX` finds the temperature at the next pressure that conserves the parcel's molar
+entropy, equilibrating the phases at every trial temperature. The Newton step of that search needs the derivative
+of entropy with respect to temperature *along the saturation curve*, which is the frozen heat capacity plus a
+latent term; that sum is the effective heat capacity, and the latent term is read off the gain matrix that the
+saturation solver of @sec-ch04 returns. An option drops the condensate after each step for a
+pseudo-adiabat. This is the moist adiabat with several condensing species of Li, Ingersoll and Oyafuso
+([J. Atmos. Sci. 75, 1063, 2018](https://doi.org/10.1175/JAS-D-17-0257.1)), written for an arbitrary set of
+nucleation reactions, with the entropy of @sec-ch03-entropy as its conserved quantity.
+
+::: {.callout-note title="At a glance"}
+**Purpose.** Step $(T, p, x)$ along an adiabat by $\Delta\ln p$ or $\Delta z$, conserving molar entropy;
+the effective heat capacity is @eq-ch03-adiabat-cp-eff.
+
+**Data.** In and out, in place: $T$ [K], $p$ [Pa], mole fractions $x_i$ of all species; parameters
+$\Delta\ln p$ or $\Delta z$ [m] with $g$ [$\mathrm{m\,s^{-2}}$]; optional entropy source per step.
+
+**Placement.** `ThermoX.extrapolate_dlnp` and `ThermoX.extrapolate_dz`; `ThermoX.effective_cp` on its own after
+any `forward`.
+
+**Activation.** Called explicitly by a host or script; `rainout` (default off) drops the condensates after each step;
+`ds_dlnp` or `ds_dz` (default 0) adds an entropy source; `max-iter` and `ftol` of the card bound the search.
+
+**Guarantee / limits.** Entropy conserved to $10\,\varepsilon_{\mathrm{tol}}$ per step (the stopping test); first-order
+accurate in the step size; `dz` steps iterate hydrostatic balance with the mean density of the step.
+
+**Evidence.** The Tests layer below: `DeviceTest.extrapolate_ad` (entropy to $10^{-3}$), the deep-Jupiter example
+(entropy to $10^{-5}\,\mathrm{J\,kg^{-1}\,K^{-1}}$, dry limit to $10^{-5}\,\mathrm K$).
+:::
+
+Local symbols: $s$ the molar entropy of the parcel, all species counted [$\mathrm{J\,mol^{-1}\,K^{-1}}$]
+($S/\sum_i c_i$); $\xi_j$ the extent of reaction $j$ per mole of parcel [-]; $\mathsf G$ the gain matrix of the
+saturation solver, $G_{jk} = \partial r_j/\partial \xi_k$ with $r_j$ the saturation residual of @sec-ch04
+(`gain`); $L'_j = \mathrm dL_j/\mathrm dT$; $c_{p}^{\mathrm{eff}}$ the effective molar heat capacity
+[$\mathrm{J\,mol^{-1}\,K^{-1}}$]; $g$ the gravitational acceleration, positive downward [$\mathrm{m\,s^{-2}}$];
+$\bar M = \sum_i x_i M_i$ the mean molar mass. The internal names are `effective_cp`, `extrapolate_dlnp`,
+`extrapolate_dz`; the options object is `ExtrapOptions`.
+
+### Derivation
+
+**The effective heat capacity.** At fixed pressure, along the saturation curve, the parcel's enthalpy changes with
+temperature both through the heat capacities and through the extents of the phase changes:
+$$
+\frac{\mathrm dH}{\mathrm dT}\Bigr|_{p,\,\mathrm{sat}} = \sum_i x_i c_{p,i} + \sum_j \Bigl(\sum_i h_i \nu_{ij}\Bigr)\frac{\mathrm d\xi_j}{\mathrm dT} .
+$$
+The extents follow the saturation conditions $r_j(T, \boldsymbol\xi) = 0$ of the active
+reactions (@sec-ch04). Differentiating along the curve, $\sum_k G_{jk}\,\mathrm d\xi_k/\mathrm dT = \partial r_j/\partial T$,
+and since $r_j$ depends on $T$ only through $-L_j(T)$, the right-hand side is $L'_j(T)$ up to the sign convention of
+the solver's gain matrix. kintera therefore solves the linear system
+$$
+\mathsf G\,\frac{\mathrm d\boldsymbol\xi}{\mathrm dT} = \mathbf L', \qquad
+c_p^{\mathrm{eff}} = \sum_i x_i\,c_{p,i} + \sum_j \Bigl(\sum_i h_i \nu_{ij}\Bigr)\frac{\mathrm d\xi_j}{\mathrm dT},
+$$ {#eq-ch03-adiabat-cp-eff}
+where $\mathsf G$ is the gain matrix returned by the last `forward`, zero outside the active reactions.
+@eq-ch03-adiabat-cp-eff is computed in `ThermoXImpl::effective_cp`
+({{< code src/thermo/extrapolate_ad.cpp ThermoXImpl::effective_cp >}}), with $L'_j$ from `LogSVPFunc::grad`
+({{< code src/thermo/log_svp.hpp LogSVPFunc::grad >}}) and $h_i$, $c_{p,i}$ from @sec-ch03-caloric. For one vapour
+condensing in a carrier gas the gain is the scalar $G = 1/x_{\mathrm g} - 1/x_v$ (`[C1]` of `adiabat_check.py`),
+$\sum_i h_i\nu_{ij} = h_c - h_v = -\ell$, and the latent term becomes
+$$
+c_p^{\mathrm{latent}} = \ell\,L'\,\frac{x_v x_{\mathrm g}}{x_{\mathrm g} - x_v}
+\;\xrightarrow{\;x_v \ll x_{\mathrm g}\;}\; x_v\,\frac{\ell^2}{\mathcal R T^2},
+$$ {#eq-ch03-adiabat-latent-single}
+using $L' = \ell/(\mathcal R T^2)$ for an ideal vapour: the classical moist correction (`[C2]`). For the water case
+of @fig-ch03-adiabat-effective-cp at $290\,\mathrm K$ and $1\,\mathrm{bar}$ the latent term is $1.3$ times the frozen
+heat capacity (`[C3]`).
+
+The linear solve is ill-conditioned when one active reaction involves a nearly depleted vapour: that reaction's row
+of $\mathsf G$ is scaled by $1/x_v$ and can be $10^{12}$ times larger than the row that carries the latent heat, and a
+least-squares solver with a relative rank tolerance drops exactly the small row. The code therefore divides each
+row of $\mathsf G$ and the matching entry of $\mathbf L'$ by the row's largest magnitude before the solve (the same
+solution in exact arithmetic, condition number of order one), solves with the `gelsd` driver on CPU (whose pivoting,
+unlike the default driver's, does not depend on uninitialised memory) and with a pseudo-inverse of absolute tolerance
+$10^{-6}$ on CUDA; a zero row (inactive reaction) keeps scale one and a zero rate.
+
+**Stepping in pressure.** The parcel's molar entropy $s_0$ at the start is the target. After multiplying the pressure
+by $e^{\Delta\ln p}$, each pass restores the starting composition, equilibrates it at the current $T$
+(`forward`, which also returns $\mathsf G$), evaluates $s(T)$ and $c_p^{\mathrm{eff}}$, and updates
+$$
+T \leftarrow T\Bigl(1 + \frac{s_{\mathrm{target}} - s(T)}{c_p^{\mathrm{eff}}}\Bigr), \qquad
+s_{\mathrm{target}} = s_0 + \frac{\mathrm ds}{\mathrm d\ln p}\,\Delta\ln p ,
+$$ {#eq-ch03-adiabat-newton}
+until $|s_{\mathrm{target}} - s(T)| < 10\,\varepsilon_{\mathrm{tol}}$ (in $\mathrm{J\,mol^{-1}\,K^{-1}}$, an absolute
+test) or `max-iter` passes. @eq-ch03-adiabat-newton is computed in `ThermoXImpl::extrapolate_dlnp`
+({{< code src/thermo/extrapolate_ad.cpp ThermoXImpl::extrapolate_dlnp >}}). It is the Newton step on
+$s(T) - s_{\mathrm{target}}$ with $\partial s/\partial T|_{p,\mathrm{sat}} = c_p^{\mathrm{eff}}/T$, linearised in $T$
+instead of $\ln T$; the remainder of one step is $c_p\,\delta^2/2$ with $\delta = (s_{\mathrm{target}} - s)/c_p$,
+so the convergence is quadratic (`[C4]`). With `rainout` the condensates are removed from the composition after
+each equilibration and the target is reduced by the entropy they carry away, per mole of gas,
+$$
+s_{\mathrm{target}} = \frac{x_{\mathrm{dry}}}{x_{\mathrm{dry},0}}\,s_0 - \frac{\sum_{i \ge N_{\mathrm g}} s_i c_i}{c_{\mathrm g}} + \frac{\mathrm ds}{\mathrm d\ln p}\,\Delta\ln p ,
+$$ {#eq-ch03-adiabat-rainout}
+where the first factor rescales the starting entropy to the moles of (conserved) dry gas and the condensate
+entropies $s_i$ are those of @sec-ch03-entropy; @eq-ch03-adiabat-rainout is computed in the same
+`extrapolate_dlnp` (`[C5]`).
+
+**Stepping in height.** `extrapolate_dz` ({{< code src/thermo/extrapolate_ad.cpp ThermoXImpl::extrapolate_dz >}})
+takes the same Newton step with two additions: the pressure at the new height is not known in advance, so it starts
+from the isothermal guess $p_0\exp(-g\bar M\Delta z/\mathcal R T)$ and in each pass re-evaluates hydrostatic balance
+with the mean of the start and current densities,
+$$
+p \leftarrow p_0 - \tfrac12(\rho + \rho_0)\,g\,\Delta z, \qquad
+T \leftarrow T\Bigl(1 + \frac{s_{\mathrm{target}} - s + x_{\mathrm g}\mathcal R\,\Delta\ln p}{c_p^{\mathrm{eff}}}\Bigr),
+$$ {#eq-ch03-adiabat-dz}
+where $\Delta\ln p$ is the change of $\ln p$ within the pass and the term $x_{\mathrm g}\mathcal R\,\Delta\ln p$ is the
+entropy change of the gas moles that the pressure update itself causes. @eq-ch03-adiabat-dz is computed in
+`ThermoXImpl::extrapolate_dz`. The hydrostatic update is the trapezoidal rule in $z$ with one Picard iteration per
+Newton pass.
+
+What is exact: the entropy conservation at convergence, to the stopping tolerance. What is truncated: the step is
+first-order accurate in $\Delta\ln p$ or $\Delta z$ (the entropy is conserved at the end point, but the composition
+that enters the latent heat is equilibrated at the end point only); the effective heat capacity is exact for the
+linearised saturation conditions. The executable check is `adiabat_check.py` (`[C1]` to `[C5]`).
+
+### Numerical method
+
+Each step is an outer loop of at most `max-iter` passes over all cells at once. One pass is: restore $x$ to the
+start of the step; `forward` at $(T, p)$, which returns $\mathsf G$; optionally drop the condensates and
+renormalise; `TPX->V`, `effective_cp`, `TPV->S`; the convergence test on $\max_{\mathrm{cells}}|s_{\mathrm{target}} - s|$;
+the temperature update. The `dz` variant inserts the pressure update before the temperature update.
+@fig-ch03-adiabat-effective-cp shows the frozen and effective heat capacities of a water-saturated parcel of air and
+the resulting dry and moist lapse rates $\mathrm d\ln T/\mathrm d\ln p = x_{\mathrm g}\mathcal R/c_p$. For the Jupiter
+test card and $\Delta\ln p = -0.1$ at $200\,\mathrm K$, `DeviceTest.extrapolate_ad` runs with `max-iter` 15 and
+`ftol` $10^{-8}$; the deep-Jupiter example instead calls `forward` inside its own bisection on specific entropy
+(`run_column`, {{< code examples/example_jupiter_adiabat.py run_column >}}), because it needs entropy per unit mass
+rather than per mole when the $\mathrm{MgSiO_3}$ reaction changes the number of molecules.
+
+```{python}
+#| label: fig-ch03-adiabat-effective-cp
+#| fig-cap: "A water-saturated parcel of dry air at 1 bar with the `h2o_ideal` curve and the heat capacities of the Jupiter test card. (a) The frozen heat capacity (dotted black) and the effective heat capacity with the latent term of the single-reaction closed form (green). (b) The dry (dotted black) and saturated (green) adiabatic lapse rates, the logarithmic derivative of temperature with respect to pressure, that the pressure step integrates."
+#| fig-alt: "Panel (a): the frozen heat capacity is a flat line near 29 joules per mole per kelvin while the effective heat capacity rises steeply from about 35 at 240 K to above 200 at 320 K. Panel (b): the dry lapse rate is flat at about 0.29 while the saturated lapse rate falls from about 0.24 at 240 K to below 0.05 at 320 K."
+#| echo: false
+from kintera_report.ch03.figures.fig_adiabat_effective_cp import make_fig
+make_fig()
+```
+
+### Code
+
+| what | code link | symbol | switch |
+|---|---|---|---|
+| $c_p^{\mathrm{eff}}$, @eq-ch03-adiabat-cp-eff | {{< code src/thermo/extrapolate_ad.cpp ThermoXImpl::effective_cp >}} | `ThermoXImpl::effective_cp` | always |
+| $L'_j(T)$ | {{< code src/thermo/log_svp.hpp LogSVPFunc::grad >}} | `LogSVPFunc::grad` | always |
+| pressure step, @eq-ch03-adiabat-newton, @eq-ch03-adiabat-rainout | {{< code src/thermo/extrapolate_ad.cpp ThermoXImpl::extrapolate_dlnp >}} | `ThermoXImpl::extrapolate_dlnp` | `dlnp`, `ds_dlnp`, `rainout` |
+| height step, @eq-ch03-adiabat-dz | {{< code src/thermo/extrapolate_ad.cpp ThermoXImpl::extrapolate_dz >}} | `ThermoXImpl::extrapolate_dz` | `dz`, `grav`, `ds_dz`, `rainout` |
+| step options | {{< code src/thermo/thermo.hpp ExtrapOptions::rainout >}} | `ExtrapOptions::rainout` | always |
+| Python binding of the three | {{< code python/csrc/pythermo.cpp bind_thermo >}} | `bind_thermo` | always |
+| a column by `dz` steps | {{< code examples/example_earth.py >}} | `example_earth.py` | example |
+| a column by entropy bisection | {{< code examples/example_jupiter_adiabat.py run_column >}} | `run_column` | example |
+
+: Code map of the adiabatic extrapolation. {#tbl-ch03-adiabat-code}
+
+Walk-through of one `extrapolate_dlnp` call:
+
+1. `TPX->V`, `TPV->S` give $s_0$; `x_dry0` is recorded for the rain-out rescaling.
+2. $p \leftarrow p\,e^{\Delta\ln p}$; the start composition is saved.
+3. Each pass: restore $x$; `forward` (@sec-ch04) returns $\mathsf G$; with `rainout`, the condensate
+   entropies are taken from `eval_entropy_R` and the condensates zeroed; `effective_cp`; `TPV->S`; test; update.
+4. After `max-iter` passes without convergence the function warns `extrapolate_dlnp does not converge` and returns
+   the last state in place.
+
+In Python, a column of forty layers by height steps (the Earth example) and a single pressure step with rain-out:
+
+```python
+# one height step, in place
+thermo.extrapolate_dz(temp[:, i], pres[:, i], xfrac[:, i, :], dz=100., grav=9.8)
+# one pressure step as a pseudo-adiabat
+thermo.extrapolate_dlnp(temp, pres, xfrac, dlnp=-0.1, rainout=True)
+# effective heat capacity, J mol^-1 K^-1, from the gain of a fresh adjustment
+gain = thermo.forward(temp, pres, xfrac)
+cp_eff = thermo.effective_cp(temp, pres, xfrac, gain)
+```
+
+### Tests
+
+| test (ctest name) | what it asserts | tolerance | where the tolerance comes from |
+|---|---|---|---|
+| `tests/test_thermo.cpp` (`test_thermo`), `DeviceTest.extrapolate_ad` | molar entropy before and after one `dlnp = -0.1` step on the Jupiter card agree (double only) | `allclose`, $10^{-3}$ | set in the test; the stopping test is $10\times10^{-8}$ |
+| `tests/test_effective_cp_heap_state.py` (`test_python_subprocess`) | `effective_cp` on CPU is bitwise independent of the heap contents and keeps the latent term when one reaction's gain row is zero; batch columns do not share pivots | exact (bitwise) | the `gelsd` driver removes the dependence |
+| `tests/test_jupiter_tp_adiabat.py` (`test_jupiter_tp_adiabat.py`) | the example column conserves specific entropy; elements and mass conserved; phase residual; 31 and 61 levels agree; with no condensables the analytic dry adiabat is recovered | $10^{-5}\,\mathrm{J\,kg^{-1}\,K^{-1}}$; $10^{-10}$; $2\times10^{-7}$; $10^{-4}\,\mathrm K$; $10^{-5}\,\mathrm K$ | the example's bisection tolerance; round-off; the solver's `ftol` $10^{-8}$ with margin; grid study; closed form |
+| `src/kintera_report/ch03/checks/adiabat_check.py` | single-reaction gain and latent term; the dilute limit; the Newton remainder; the rain-out target | symbolic; $2\,\%$ of the predicted remainder | algebra |
+
+: Tests of the adiabatic extrapolation. {#tbl-ch03-adiabat-tests}
+
+`DeviceTest.extrapolate_ad` passed on CPU and CUDA in double in the recorded CUDA-build run (its float instances are
+skipped by the test),[^ch03-adiabat-run] `test_jupiter_tp_adiabat.py` and `test_effective_cp_heap_state.py` in
+the recorded CPU runs.[^ch03-adiabat-pyrun] The $10^{-3}$ of the C++ test is loose against the $10^{-7}$ its own
+stopping test implies; it is a smoke test. No test measures the order of accuracy of a step against the step size,
+and no test exercises `rainout` or `extrapolate_dz` directly (the Earth example runs `extrapolate_dz` but asserts
+nothing).
+
+[^ch03-adiabat-run]: [sha: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45; deck: `tests/jupiter.yaml`; run:
+    `ctest -R 'test_thermo|test_equilibrate_tp_max_iter' -V` in the `tests/` directory of a CUDA build
+    (`cmake -DCUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120`), CPU and CUDA (one RTX 5090), double (float skipped);
+    `test_thermo` 66 passed, 8 skipped; gcc 11.5.0, CUDA 12.9, cmake 3.31.8, libtorch of torch 2.10.0+cu128]
+
+[^ch03-adiabat-pyrun]: [sha: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45; deck: `examples/jupiter_kcl_mgsio3.yaml`
+    and the card `test_effective_cp_heap_state.py` writes; run: `PYTHONPATH=<install-dir> pytest tests/test_jupiter_tp_adiabat.py`
+    (2 passed) and the CPU selection `PYTHONPATH=<install-dir> pytest tests/test_equilibrium.py tests/test_nasa9_cp.py tests/test_h2_cp.py tests/test_inline_svp.py tests/test_equilibrate_uv_gain.py tests/test_latent_heat_sign.py tests/test_saturation_adjustment_nh4sh.py tests/test_saturation_degenerate_bound.py tests/test_effective_cp_heap_state.py tests/test_earth.py tests/test_reference_state_keys.py`
+    (47 passed), CPU, double; Python 3.11.13, torch 2.10.0+cu128, numpy 2.4.6]
+
+### Limits
+
+::: {.callout-warning title="Limits"}
+- Each step is first order in the step size and the Newton search is capped by the card's `max-iter` (default 10),
+  which the Jupiter test raises to 15 and the deep-Jupiter card to 200; a step that does not converge is returned
+  with a warning only. Not measured: the error against step size.
+- `effective_cp` on CUDA uses a pseudo-inverse with an absolute tolerance of $10^{-6}$ after row scaling; a gain
+  matrix whose scaled singular values fall below that loses its latent term silently. Not measured.
+- The entropy target is per mole of parcel (all species) in `extrapolate_dlnp`, which is not conserved along a
+  reversible adiabat when a reaction changes the number of molecules (the deep-Jupiter case); the example therefore
+  bypasses this routine and bisects on entropy per unit mass.
+- A card that is not Kirchhoff-consistent (@sec-ch03-reference-state) gives an adiabat whose latent heating does
+  not match its saturation curve; `tests/jupiter.yaml` is such a card.
+- `rainout` removes all condensates every step (no partial fallout) and is untested at the pin.
+:::

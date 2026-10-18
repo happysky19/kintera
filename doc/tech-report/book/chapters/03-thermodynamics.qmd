@@ -1,3 +1,47 @@
 # Equation of state and thermodynamic functions {#sec-ch03}
 
-pending
+This chapter describes the thermodynamic state of a kintera mixture and the functions that evaluate it: the species
+order and the two state vectors (mole fractions in `ThermoX`, mass fractions in `ThermoY`); the ideal-gas equation
+of state with its inversions; the heat capacities and internal energies, in the constant-heat-capacity baseline and
+in the two opt-in models for temperature-dependent gases; the reference state at which the card gives its data and
+the latent heat that follows from it; the entropy of gases and condensates, where the condensate entropy is derived
+from the saturation curve; the saturation ratio as a diagnostic; and the moist adiabatic extrapolation that steps a
+parcel in pressure or height while conserving its entropy. The phase-equilibrium solvers that the entropy and the
+adiabat depend on are the subject of @sec-ch04; the saturation-pressure curves themselves belong to @sec-ch02. All
+formulas are written for the species indices and symbols defined in @sec-ch03-species-state, and every scheme ends
+with an executable check under `src/kintera_report/ch03/checks/` whose output is committed next to it.
+
+```{python}
+#| label: fig-ch03-depmap
+#| fig-cap: "Dependency map of the chapter: the seven schemes as nodes and \"requires\" as green arrows. The state vectors feed the equation of state, which with the reference state feeds the caloric functions; those and the reference state feed the entropy; the entropy and the caloric functions feed the moist adiabat; the saturation ratio needs only the state vectors."
+#| fig-alt: "Seven boxes connected by arrows: species and state vectors to equation of state, to heat capacities and energy, to entropy and free energies, to moist adiabat; reference state and latent heat points to the heat capacities and to the entropy; species and state vectors also points to the saturation ratio."
+#| echo: false
+from kintera_report.ch03.figures.fig_ch03_depmap import make_fig
+make_fig()
+```
+
+| scheme | YAML key or option | default | order | main test |
+|---|---|---|---|---|
+| @sec-ch03-species-state | `species`, `phase` | inferred from reactions | exact | `DeviceTest.thermo_y` |
+| @sec-ch03-eos | `dynamics/equation-of-state` | `max-iter` 10, `ftol` $10^{-6}$ | exact (ideal gas) | `DeviceTest.eng_pres` |
+| @sec-ch03-caloric | `cv_R`, `use-nasa9-cp`, `use-h2-cp` | $5/2$, off, off | exact per model | `test_nasa9_cp.py`, `test_h2_cp.py` |
+| @sec-ch03-reference-state | `reference-state` | `Tref` 300 K, `Pref` $10^5$ Pa | exact | `test_latent_heat_sign.py` |
+| @sec-ch03-entropy | `PVT->S`, `TPV->S` | always | exact (one-to-one blocks) | `DeviceTest.thermo_x` |
+| @sec-ch03-relative-humidity | `relative_humidity(..., ngas)` | `ngas` $-1$ | exact | `test_inline_svp.py` |
+| @sec-ch03-adiabat | `extrapolate_dlnp`, `extrapolate_dz`, `rainout` | `rainout` off | first order in the step | `test_jupiter_tp_adiabat.py` |
+
+: The schemes of this chapter. {#tbl-ch03-schemes}
+
+{{< include 03-thermodynamics/_species-state.qmd >}}
+
+{{< include 03-thermodynamics/_eos.qmd >}}
+
+{{< include 03-thermodynamics/_caloric.qmd >}}
+
+{{< include 03-thermodynamics/_reference-state.qmd >}}
+
+{{< include 03-thermodynamics/_entropy.qmd >}}
+
+{{< include 03-thermodynamics/_relative-humidity.qmd >}}
+
+{{< include 03-thermodynamics/_adiabat.qmd >}}

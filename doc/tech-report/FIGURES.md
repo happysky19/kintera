@@ -8,3 +8,16 @@ for a file a model run wrote, a pointer to the run recorded in the file.
 Regenerate every figure: `python3 tools/render_figures.py` (to `build/figures/<chapter>/`); one chapter:
 `python3 tools/render_figures.py --chapters ch05`. The book itself draws them in the render
 (`quarto render book/`), from the same cells.
+
+## ch03
+
+| figure | section file | code | data (written by) |
+|---|---|---|---|
+| `fig-ch03-adiabat-effective-cp` | `03-thermodynamics/_adiabat.qmd` | `kintera_report/ch03/figures/fig_adiabat_effective_cp.py` | - |
+| `fig-ch03-caloric-h2cp` | `03-thermodynamics/_caloric.qmd` | `kintera_report/ch03/figures/fig_caloric_h2cp.py` | `src/kintera_report/ch03/data/nasa9_h2.dat` (`kintera_report/ch03/checks/caloric_check.py`) |
+| `fig-ch03-depmap` | `03-thermodynamics.qmd` | `kintera_report/ch03/figures/fig_ch03_depmap.py` | - |
+| `fig-ch03-entropy-condensate` | `03-thermodynamics/_entropy.qmd` | `kintera_report/ch03/figures/fig_entropy_condensate.py` | - |
+| `fig-ch03-eos-conversions` | `03-thermodynamics/_eos.qmd` | `kintera_report/ch03/figures/fig_eos_conversions.py` | - |
+| `fig-ch03-reference-state-offsets` | `03-thermodynamics/_reference-state.qmd` | `kintera_report/ch03/figures/fig_reference_state_offsets.py` | - |
+| `fig-ch03-relative-humidity-quotient` | `03-thermodynamics/_relative-humidity.qmd` | `kintera_report/ch03/figures/fig_relative_humidity_quotient.py` | - |
+| `fig-ch03-species-state-layout` | `03-thermodynamics/_species-state.qmd` | `kintera_report/ch03/figures/fig_species_state_layout.py` | - |

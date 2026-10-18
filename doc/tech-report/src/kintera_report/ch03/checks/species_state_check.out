@@ -1,0 +1,5 @@
+[C1] PASS _yfrac_to_xfrac closed form equals (y_i/M_i)/sum(y_k/M_k): difference simplifies to 0
+[C2] PASS X->Y inverts Y->X: max relative error 8.66e-17 (tolerance 1e-14)
+[C3] PASS DY->V then V->Y round trip: sum(rho_i) - rho = 0.00e+00, max |y' - y| = 1.73e-18 (tolerance 1e-15)
+[C4] PASS sum_gas c_i R T / p - 1 = 3.33e-16; cloud ratio error 6.94e-18 (tolerance 1e-14); gas total 48.108957 mol m^-3 at 250.0 K, 100000 Pa
+species_state_check: 4 of 4 passed

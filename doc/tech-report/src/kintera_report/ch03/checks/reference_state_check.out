@@ -1,0 +1,7 @@
+[C1] PASS u(T) with the shifted offset: difference 0
+[C2] PASS s(T, p) with the shifted offset: difference 0; clamp max(Tref, 1) = 1 for Tref = 0
+[C3] PASS latent heat at Tref: H2O <=> H2O(l) 3430 K (silent); bare condensate 0 K (warned)
+[C4] PASS T^2 d ln p_sat/dT = -T*delta + T_r*beta (Kirchhoff form beta T_r - delta T)
+[C5] PASS h2o_bryan: beta = 24.815845125 (code 24.815845), R_v = 461.529836 J kg^-1 K^-1, L(273.15 K) = 2500000.000 J kg^-1
+[C6] PASS card: u0_R(KCl(s)) = -26208.02352846 K, u0_R(MgSiO3(s)) = -114887.48321494 K, delta cp/R = 0.0, 0.0
+reference_state_check: 6 of 6 passed

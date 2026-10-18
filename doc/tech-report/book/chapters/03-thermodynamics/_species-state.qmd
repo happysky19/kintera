@@ -1,0 +1,233 @@
+## Species, phases and the two state vectors (`species`) {#sec-ch03-species-state}
+
+<!-- PROVENANCE
+pin: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45 (main)
+sources: src/species.hpp, src/species.cpp, src/thermo/thermo.hpp, src/thermo/thermo_options.cpp, src/thermo/thermo_x.cpp, src/thermo/thermo_y.cpp, src/thermo/nucleation.cpp, tests/jupiter.yaml, tests/test_thermo.cpp
+status: draft
+author: Tianhao Le (happysky19)
+reviewer: Linfeng (requested)
+-->
+
+### Summary
+
+Every thermodynamic routine of kintera works on a list of species that is split into two groups: the gases first,
+then the condensates. The list is read once from the `species` block of the YAML card, every reaction of the card
+sorts its participants into one of the two groups, and from then on the position of a species in the list is its
+index everywhere: in the mole-fraction vector of `ThermoX`, in the mass-fraction vector of `ThermoY`, in the
+stoichiometric matrix and in the outputs of the saturation solvers of @sec-ch04. This section fixes that ordering,
+the two state vectors and the conversions between them, because every later formula in this chapter and in
+@sec-ch04 is written in those indices.
+
+::: {.callout-note title="At a glance"}
+**Purpose.** Define the species order (gases, then condensates), the mole-fraction state $x_i$ of `ThermoX` and the
+mass-fraction state $y_i$ of `ThermoY`, and the conversions between them; the defining relation is
+@eq-ch03-species-state-x-from-y.
+
+**Data.** `species` entries of the card with `name`, `composition`, optional `phase`, `cv_R`, `u0_R`, `s0_R`; in
+memory `vapor_ids`, `cloud_ids`, `mu` [$\mathrm{kg\,mol^{-1}}$]; $x_i$ on the last tensor axis, $y_i$ on the first.
+
+**Placement.** At construction of `ThermoOptions` (card reading) and of `ThermoX` or `ThermoY` (`reset`); the
+conversions run whenever a host code calls `compute` with one of the keys of @tbl-ch03-species-state-code.
+
+**Activation.** Always; `phase: gas|liquid|solid` is optional and only the explicit way to put an inert gas or a gaseous
+reaction product into the gas group.
+
+**Guarantee / limits.** The conversions are exact algebra, closed to round-off; a card whose phases contradict its
+reactions is refused at load.
+
+**Evidence.** The Tests layer below: `test_thermo` round trips on CPU and CUDA, float and double.
+:::
+
+Local symbols of this section, used throughout the chapter: $N$ species of which $N_{\mathrm g}$ are gases and
+$N_{\mathrm c} = N - N_{\mathrm g}$ condensates, indexed by $i = 0, \dots, N-1$ in the order above (species $0$ is the
+first gas, the reference species of the mass basis); $x_i$ the mole fraction of species $i$ among all species, gas and
+condensed [-]; $y_i$ its mass fraction [-]; $c_i$ its molar concentration [$\mathrm{mol\,m^{-3}}$]; $\rho_i$ its
+partial density [$\mathrm{kg\,m^{-3}}$] and $\rho = \sum_i \rho_i$ the total density; $M_i$ its molar mass
+[$\mathrm{kg\,mol^{-1}}$]; $x_{\mathrm g} = \sum_{i < N_{\mathrm g}} x_i$ the gas share of the moles and
+$c_{\mathrm g} = \sum_{i < N_{\mathrm g}} c_i$ the gas concentration. None of these is in the shared notation table
+yet; they are proposed to the editor. The internal name of the mole basis is `ThermoX` and of the
+mass basis `ThermoY`; the code calls the gas group `vapor` and the condensate group `cloud`.
+
+### Derivation
+
+The card lists species by name and elemental composition. The molar mass $M_i$ is the composition-weighted sum of the
+element masses, and the optional caloric entries `cv_R`, `u0_R` and `s0_R` are stored as they are read (their meaning
+is the subject of @sec-ch03-caloric and @sec-ch03-reference-state). A species that is named nowhere else is a gas
+only if the card says `phase: gas`; otherwise the groups are inferred from the reactions: every nucleation reactant is
+a gas, every nucleation product without `phase: gas` is a condensate, and the first species of the card is a gas (the
+reference species). Within each group the species keep the card order. The result is the species vector of the whole
+chapter,
+$$
+(\underbrace{x_0, x_1, \dots, x_{N_{\mathrm g}-1}}_{\text{gases}},\;
+ \underbrace{x_{N_{\mathrm g}}, \dots, x_{N-1}}_{\text{condensates}}),
+$$
+and no routine infers an index from the text of a reaction.
+
+`ThermoX` keeps mole fractions of *all* species, so that $\sum_{i=0}^{N-1} x_i = 1$ and the condensates are counted
+in the moles; `ThermoY` keeps the mass fractions $y_1, \dots, y_{N-1}$ of every species except the reference species,
+whose mass fraction is $y_0 = 1 - \sum_{i \ge 1} y_i$. The two are related through the molar masses. With
+$y_i = x_i M_i / \sum_k x_k M_k$, dividing numerator and denominator by $M_0$ and eliminating $x_0 = 1 - \sum_{k\ge1}
+x_k$ gives, for $i \ge 1$,
+$$
+x_i = \frac{y_i\,M_0/M_i}{1 + \sum_{k \ge 1} y_k\,(M_0/M_k - 1)}, \qquad x_0 = 1 - \sum_{i \ge 1} x_i,
+$$ {#eq-ch03-species-state-x-from-y}
+which is the form the code evaluates: @eq-ch03-species-state-x-from-y
+is computed in `ThermoYImpl::_yfrac_to_xfrac` ({{< code src/thermo/thermo_y.cpp ThermoYImpl::_yfrac_to_xfrac >}}),
+with `inv_mu` holding $1/M_i$ and `mud` the reference mass $M_0$. The inverse map is the definition itself,
+$$
+y_i = \frac{x_i M_i}{\sum_{k=0}^{N-1} x_k M_k}, \qquad i = 1, \dots, N-1,
+$$ {#eq-ch03-species-state-y-from-x}
+and @eq-ch03-species-state-y-from-x is computed in `ThermoXImpl::_xfrac_to_yfrac`
+({{< code src/thermo/thermo_x.cpp ThermoXImpl::_xfrac_to_yfrac >}}). That the two are inverses is checked
+symbolically and numerically (check lines `[C1]` and `[C2]` of `species_state_check.py`).
+
+The mass basis also needs the partial densities. Given the total density $\rho$ and the mass fractions,
+$$
+\rho_0 = \rho\,\Bigl(1 - \sum_{i \ge 1} y_i\Bigr), \qquad \rho_i = \rho\,y_i \quad (i \ge 1),
+$$ {#eq-ch03-species-state-ivol}
+and @eq-ch03-species-state-ivol is computed in `ThermoYImpl::_yfrac_to_ivol`
+({{< code src/thermo/thermo_y.cpp ThermoYImpl::_yfrac_to_ivol >}}); the code calls the vector of partial densities
+`ivol`. Its inverse $y_i = \rho_i / \sum_k \rho_k$ is `ThermoYImpl::_ivol_to_yfrac`
+({{< code src/thermo/thermo_y.cpp ThermoYImpl::_ivol_to_yfrac >}}), and the molar concentrations follow as
+$c_i = \rho_i / M_i$ wherever a caloric function needs them (`[C3]`).
+
+The mole basis needs concentrations from $(T, p, x)$. For an ideal gas the gas-only mole fractions
+$x_i / x_{\mathrm g}$ are the partial-pressure fractions, so
+$$
+c_i = \frac{x_i}{x_{\mathrm g}}\,\frac{p}{\mathcal R\,T} \quad (i < N_{\mathrm g}), \qquad
+c_i = c_0\,\frac{x_i}{x_0} \quad (i \ge N_{\mathrm g}),
+$$ {#eq-ch03-species-state-conc}
+where the condensates are scaled from the reference gas so that the mole ratios of the input are kept.
+@eq-ch03-species-state-conc is computed in `ThermoXImpl::_xfrac_to_conc`
+({{< code src/thermo/thermo_x.cpp ThermoXImpl::_xfrac_to_conc >}}), whose Newton loop on the compressibility factor
+is the subject of @sec-ch03-eos; with the ideal-gas factor it is the closed form above (`[C4]`). The reverse step, the
+total density from concentrations, is $\rho = \sum_i c_i M_i$ in `ThermoXImpl::_conc_to_dens`
+({{< code src/thermo/thermo.hpp ThermoXImpl::_conc_to_dens >}}).
+
+Everything in this section is exact algebra; the only approximation is the ideal-gas relation in
+@eq-ch03-species-state-conc, whose generalisation is @sec-ch03-eos. The check `species_state_check.py` verifies the
+closed forms symbolically and the round trips to round-off.
+
+### Numerical method
+
+There is no iteration here. The two state vectors differ in layout as well as in basis, and the layout is what a host
+code has to get right: `ThermoX` stores $x_i$ on the *last* tensor axis, shape $(\dots, 1 + n_y)$ with
+$n_y = N - 1$, while `ThermoY` stores $y_i$ on the *first* axis, shape $(n_y, \dots)$, so that a hydrodynamic code
+can hand over its tracer array without a copy. @fig-ch03-species-state-layout shows both for the species of
+`tests/jupiter.yaml` (four gases, three condensates). Every conversion permutes the species axis to the front,
+operates, and permutes back; the permutation is a view, not a copy.
+
+```{python}
+#| label: fig-ch03-species-state-layout
+#| fig-cap: "The two state vectors for the species of the Jupiter test card: mole fractions of all seven species on the last axis of `ThermoX` (top row) and mass fractions of the six non-reference species on the first axis of `ThermoY` (bottom row), where the reference species is implied by the remainder (hatched). Filled boxes are gases, white boxes condensates; the green arrows are the two conversion keys."
+#| fig-alt: "Two rows of boxes: the upper row has seven boxes labelled dry, H2O, NH3, H2S, H2O(l), NH3(s), NH4SH(s) with indices 0 to 6; the lower row has a hatched box for the implied reference species followed by six boxes for the other species; arrows labelled Y->X and X->Y connect the rows."
+#| echo: false
+from kintera_report.ch03.figures.fig_species_state_layout import make_fig
+make_fig()
+```
+
+The species groups are decided once, at option construction, by `ThermoOptionsImpl::from_yaml`
+({{< code src/thermo/thermo_options.cpp ThermoOptionsImpl::from_yaml overload=2 >}}): it starts the gas set with the
+first species of the card, adds the reactants and products of every nucleation, coagulation and evaporation reaction
+through `add_to_vapor_cloud` ({{< code src/thermo/nucleation.cpp add_to_vapor_cloud >}}), then adds every species
+with an explicit `phase`, refuses a species that would end up in both groups, sorts each group by card index and
+copies the caloric data in that order. A `ThermoX` or `ThermoY` built from the options then calls
+`check_dimensions` ({{< code src/species.cpp check_dimensions >}}) in its `reset` to make sure every per-species array
+has exactly $N$ entries; the arrays an object built without a card may lack are filled with no-op defaults by
+`populate_thermo` ({{< code src/species.cpp populate_thermo >}}).
+
+### Code
+
+| what | code link | symbol | switch |
+|---|---|---|---|
+| species registry from the card | {{< code src/species.cpp init_species_from_yaml overload=2 >}} | `init_species_from_yaml` | always |
+| gas and condensate groups | {{< code src/thermo/thermo_options.cpp ThermoOptionsImpl::from_yaml overload=2 >}} | `ThermoOptionsImpl::from_yaml` | `phase` |
+| reaction participants into the groups | {{< code src/thermo/nucleation.cpp add_to_vapor_cloud >}} | `add_to_vapor_cloud` | always |
+| per-species arrays complete | {{< code src/species.cpp check_dimensions >}} | `check_dimensions` | always |
+| missing hooks filled with no-ops | {{< code src/species.cpp populate_thermo >}} | `populate_thermo` | always |
+| species names in group order | {{< code src/species.cpp SpeciesThermoImpl::species >}} | `SpeciesThermoImpl::species` | always |
+| `Y->X` | {{< code src/thermo/thermo_y.cpp ThermoYImpl::_yfrac_to_xfrac >}} | `ThermoYImpl::_yfrac_to_xfrac` | always |
+| `X->Y` | {{< code src/thermo/thermo_x.cpp ThermoXImpl::_xfrac_to_yfrac >}} | `ThermoXImpl::_xfrac_to_yfrac` | always |
+| `DY->V` | {{< code src/thermo/thermo_y.cpp ThermoYImpl::_yfrac_to_ivol >}} | `ThermoYImpl::_yfrac_to_ivol` | always |
+| `V->Y` | {{< code src/thermo/thermo_y.cpp ThermoYImpl::_ivol_to_yfrac >}} | `ThermoYImpl::_ivol_to_yfrac` | always |
+| `TPX->V` | {{< code src/thermo/thermo_x.cpp ThermoXImpl::_xfrac_to_conc >}} | `ThermoXImpl::_xfrac_to_conc` | always |
+| `V->D` | {{< code src/thermo/thermo.hpp ThermoXImpl::_conc_to_dens >}} | `ThermoXImpl::_conc_to_dens` | always |
+| dispatch of the conversion keys | {{< code src/thermo/thermo_y.cpp ThermoYImpl::compute >}} | `ThermoYImpl::compute` | always |
+
+: Code map of the species order and the state conversions. {#tbl-ch03-species-state-code}
+
+Walk-through, in the order a host code meets it:
+
+1. Load the card. `init_species_from_yaml` ({{< code src/species.cpp init_species_from_yaml overload=2 >}}) fills
+   the process-global registry: names, phases, molar masses, `cv_R` (default $5/2$), `u0_R` (default 0), `s0_R`
+   (default 0) and the NASA-9 record if the name is in the bundled database. A `phase` other than `gas`, `liquid` or
+   `solid` is refused. The registry is global, which is why the kintera tests that load several cards run each in its
+   own interpreter.
+2. Build the options. `ThermoOptionsImpl::from_yaml` returns a null pointer when the card has no `reference-state`
+   block; otherwise it reads the block (@sec-ch03-reference-state), the `dynamics/equation-of-state`
+   block of @sec-ch03-eos and the reactions, and forms the two groups as described above. Three errors a user can
+   hit here:
+   `Gas species classified as cloud`, `Condensed species classified as gas` and
+   `Conflicting gas/cloud classification`, each naming the species.
+3. Build the module. `ThermoY` ({{< code src/thermo/thermo_y.cpp ThermoYImpl::reset >}}) registers the buffers
+   `inv_mu` ($1/M_i$), `cv0`, `u0` and `stoich`; `ThermoX` ({{< code src/thermo/thermo_x.cpp ThermoXImpl::reset >}})
+   registers `mu` and `stoich`. Both refuse a nucleation reaction with a condensed reactant or without a condensed
+   product.
+4. Convert. `ThermoYImpl::compute` and `ThermoXImpl::compute` ({{< code src/thermo/thermo_x.cpp ThermoXImpl::compute >}})
+   dispatch on the key string; an unknown key throws `Unknown abbreviation`, and `Y->X`, `X->Y`, `V->Y`, `DY->V` check
+   that the species axis has length $N$ or $N - 1$ (`mass fraction size mismatch`).
+
+A minimal card and the conversions it enables, in the public Python API (@sec-ch11):
+
+```python
+import torch
+from kintera import ThermoOptions, ThermoX, ThermoY
+# species: dry, H2O, NH3, H2S | H2O(l), NH3(s), NH4SH(s)
+op = ThermoOptions.from_yaml("tests/jupiter.yaml")
+tx, ty = ThermoX(op), ThermoY(op)
+yfrac = torch.full((6, 2, 3), 0.01, dtype=torch.float64)  # (n_y, ...)
+xfrac = ty.compute("Y->X", [yfrac])                     # (..., 1 + n_y)
+yback = tx.compute("X->Y", [xfrac])                     # round trip
+```
+
+### Tests
+
+| test (ctest name) | what it asserts | tolerance | where the tolerance comes from |
+|---|---|---|---|
+| `tests/test_thermo.cpp` (`test_thermo`), `DeviceTest.thermo_y` | `Y->X` sums to one; `DY->V` sums to $\rho$; `V->Y` round trip | `allclose`, rtol and atol $10^{-4}$ | set in the test; not derived |
+| `tests/test_thermo.cpp` (`test_thermo`), `DeviceTest.thermo_xy`, `DeviceTest.thermo_yx` | `X->Y` then `Y->X` and the reverse return the input | `allclose`, rtol and atol $10^{-4}$ | set in the test; not derived |
+| `tests/test_thermo.cpp` (`test_thermo`), `DeviceTest.thermo_x` | `V->D` equals $\sum_i c_i M_i$ | `allclose`, rtol and atol $10^{-4}$ | set in the test; not derived |
+| `tests/test_reaction_equilibrium.py` (`test_reaction_equilibrium.py`), `test_declared_inert_gas_and_phase_reset` | an explicit `phase: gas` species joins the gas group; a later card resets the phases | exact list comparison | exact |
+| `src/kintera_report/ch03/checks/species_state_check.py` | the closed forms are inverses; round trips | $10^{-14}$ to $10^{-15}$ relative | a few operations on $O(1)$ numbers in double precision |
+
+: Tests of the species order and the state conversions. {#tbl-ch03-species-state-tests}
+
+The `DeviceTest` cases are instantiated four times, CPU and CUDA in float and double ({{< code tests/device_testing.hpp DeviceTest >}}),
+and all four passed in the recorded run of the CUDA build.[^ch03-species-state-run] The $10^{-4}$ tolerance of
+these round trips is far looser than the algebra requires (the check reaches $10^{-16}$ in double), so it is a
+smoke test of layout and device handling, not a precision claim. `test_declared_inert_gas_and_phase_reset` passed in
+the recorded CPU run of the Python selection.[^ch03-species-state-pyrun]
+
+[^ch03-species-state-run]: [sha: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45; deck: `tests/jupiter.yaml`,
+    `tests/earth.yaml`; run: `ctest -R 'test_thermo|test_vapor_functions|test_equilibrate_tp_max_iter|test_equilibrium.release|test_species|test_reaction'`
+    in the `tests/` directory of a CUDA build (`cmake -DCUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120`), CPU and CUDA (one
+    RTX 5090), float and double; 6 of 6 binaries passed; gcc 11.5.0, CUDA 12.9, cmake 3.31.8, libtorch of
+    torch 2.10.0+cu128, Python 3.11.13]
+
+[^ch03-species-state-pyrun]: [sha: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45; deck: the cards each test
+    writes; run: `PYTHONPATH=<install-dir> pytest tests/test_cuda_workspace.py tests/test_reaction_equilibrium.py tests/test_warm_start_shape.py tests/test_thermo_x_warm_start_shape.py tests/test_saturation_failure_reported.py`,
+    CPU and CUDA (one RTX 5090), float and double; 135 passed; Python 3.11.13, torch 2.10.0+cu128, numpy 2.4.6]
+
+### Limits
+
+- The species registry is process-global: loading a second card with a different `species` list replaces it, and an
+  options object built before the reload keeps its own copy of names and masses but not of the registry. Two cards in
+  one process with different species are not a tested configuration (the kintera tests isolate them in subprocesses).
+- The implicit classification (first species and nucleation reactants are gases) is the legacy path; a card with a
+  gaseous reaction product (@sec-ch04) or an inert gas that appears in no reaction must say `phase: gas`,
+  or that species is left out of the gas group silently (an inert gas) or refused (a product).
+- `ThermoX` counts condensates in the mole fractions, so $x_i$ is not a gas-only mixing ratio and the `x_` columns of
+  the examples must be read that way; `ThermoY` carries no explicit entry for the reference species, so a negative
+  remainder $1 - \sum_{i\ge1} y_i$ is not detected here (it surfaces as a negative gas concentration in
+  @sec-ch04).
+- Not measured: the cost of the axis permutations on CUDA for large tracer arrays.

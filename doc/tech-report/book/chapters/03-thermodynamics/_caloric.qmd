@@ -1,0 +1,240 @@
+## Heat capacities and internal energy (`cv_R`, `use-nasa9-cp`, `use-h2-cp`) {#sec-ch03-caloric}
+
+<!-- PROVENANCE
+pin: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45 (main)
+sources: src/thermo/eval_uhs.cpp, src/thermo/eval_uhs.hpp, src/thermo/thermo.hpp, src/thermo/thermo_y.cpp, src/thermo/thermo_x.cpp, src/species.hpp, src/species.cpp, data/nasa9.dat, tests/test_nasa9_cp.py, tests/test_h2_cp.py, tests/test_thermo.cpp
+status: draft
+author: Tianhao Le (happysky19)
+reviewer: Linfeng (requested)
+-->
+
+### Summary
+
+The energy of a kintera parcel is the sum over species of a molar internal energy that is, by default, linear in
+temperature: each species carries one dimensionless heat capacity `cv_R` and one energy offset. That baseline is
+what the saturation solvers of @sec-ch04 and the hydrodynamic hosts assume, and it is exact for a mixture of
+calorically perfect gases and incompressible condensates. Two opt-in models replace the constant heat capacity of
+individual gases by a temperature-dependent one, for the cases where the baseline is visibly wrong: the NASA-9
+polynomial fits for any species that has a record in the bundled database, and a parameter-free rotational partition
+function for molecular hydrogen, whose heat capacity drops from $7/2\,\mathcal R$ to $5/2\,\mathcal R$ below about
+$150\,\mathrm K$ and shows the ortho-para conversion peak near $50\,\mathrm K$. This section gives the three models,
+the enthalpy and heat capacity at constant pressure that follow from them, and the inversion from energy to temperature.
+
+::: {.callout-note title="At a glance"}
+**Purpose.** $u_i(T)$, $c_{v,i}(T)$, $c_{p,i}(T)$ and $h_i(T)$ per species, @eq-ch03-caloric-u-baseline, and the
+volumetric sums $U = \sum_i c_i u_i$, $C_V$, $C_p$, $H$.
+
+**Data.** In: $T$ [K] and the concentrations $c_i$ [$\mathrm{mol\,m^{-3}}$]; out: molar quantities divided by
+$\mathcal R$ (`*_R`, in K or dimensionless) and the volumetric sums in $\mathrm{J\,m^{-3}}$ and
+$\mathrm{J\,m^{-3}\,K^{-1}}$.
+
+**Placement.** `compute` keys `VT->cv`, `VT->U`, `VU->T` (`ThermoY`) and `TV->cp`, `TV->H` (`ThermoX`); inside every
+saturation solve and adiabat step.
+
+**Activation.** Baseline always, from the card's per-species `cv_R` (default $5/2$). `reference-state:
+{use-nasa9-cp: true}` switches species with a NASA-9 record to the polynomial; `use-h2-cp: true` switches the species
+named `H2` to the rotor, with `h2-cp-mode: equilibrium` (default) or `normal`. Both default to off.
+
+**Guarantee / limits.** Baseline exact for constant heat capacities; both opt-in models join the baseline
+continuously at $T_0 = 300\,\mathrm K$ and leave the entropy on the baseline.
+
+**Evidence.** The Tests layer below: `test_nasa9_cp.py` (rtol $10^{-10}$), `test_h2_cp.py` ($2\times10^{-3}$).
+:::
+
+Local symbols: $u_i, h_i, s_i$ the molar internal energy, enthalpy and entropy of species $i$ [$\mathrm{J\,mol^{-1}}$,
+$\mathrm{J\,mol^{-1}\,K^{-1}}$]; $\hat u_i = u_i/\mathcal R$ [K] and likewise $\hat h_i$, $\hat c_{v,i}$,
+$\hat c_{p,i}$ [-] for the dimensionless forms the code stores; $u^\star_i$ the energy offset at the reference state of
+@sec-ch03-reference-state; $U, H, C_V, C_p$ the per-volume totals [$\mathrm{J\,m^{-3}}$,
+$\mathrm{J\,m^{-3}\,K^{-1}}$]; $T_0 = 300\,\mathrm K$ the junction temperature of the opt-in models (`kNasa9Tref`);
+$\theta_{\mathrm{rot}} = 87.55\,\mathrm K$ the rotational temperature of $\mathrm{H_2}$ (`kThetaRot`);
+$a_0, \dots, a_7$ the NASA-9 coefficients of one temperature range. The internal names are `eval_cv_R`, `eval_cp_R`,
+`eval_intEng_R`, `eval_enthalpy_R`; the options are `use_nasa9_cp`, `use_h2_cp`, `h2_cp_mode`.
+
+### Derivation
+
+**The baseline.** With a constant heat capacity $\hat c_{v,i}$ (`cref_R`, from the card's `cv_R`) and the offset
+$u^\star_i$ stored at $T = 0$ (@sec-ch03-reference-state), the molar internal energy of every species is
+$$
+\hat u_i(T) = \frac{u^\star_i}{\mathcal R} + \hat c_{v,i}\,T + \hat e_i(T, c_i), \qquad
+\hat c_{v,i}(T) = \hat c_{v,i} + \partial_T \hat e_i ,
+$$ {#eq-ch03-caloric-u-baseline}
+where $\hat e_i$ is an optional extra function named per species in `intEng_R_extra` (its derivative is the function of
+the same name with `_ddT` appended). @eq-ch03-caloric-u-baseline is computed in `eval_intEng_R`
+({{< code src/thermo/eval_uhs.cpp eval_intEng_R >}}) and its derivative in `eval_cv_R`
+({{< code src/thermo/eval_uhs.cpp eval_cv_R >}}). At the pin the extra-function registry is
+empty (@sec-ch03-eos), so $\hat e_i = 0$ and the baseline is the straight line of @fig-ch03-reference-state-offsets. The
+heat capacity at constant pressure adds $\mathcal R$ for a gas and nothing for a condensate (the Mayer relation of an
+ideal gas; an incompressible condensate has $c_p = c_v$),
+$$
+\hat c_{p,i} = \hat c_{v,i} + 1 \quad (i < N_{\mathrm g}), \qquad \hat c_{p,i} = \hat c_{v,i} \quad (i \ge N_{\mathrm g}),
+$$ {#eq-ch03-caloric-cp}
+and @eq-ch03-caloric-cp is computed in `eval_cp_R` ({{< code src/thermo/eval_uhs.cpp eval_cp_R >}}) (`[C5]` of
+`caloric_check.py`). The enthalpy follows as $h = u + p/c$ for a gas, which with the equation of state of
+@sec-ch03-eos is $u + z_i \mathcal R T$, and as $h = u$ plus an optional extra for a condensate:
+$$
+\hat h_i = \hat u_i + z_i\,T \quad (i < N_{\mathrm g}), \qquad \hat h_i = \hat u_i + \hat e^{h}_i \quad (i \ge N_{\mathrm g}),
+$$ {#eq-ch03-caloric-h}
+computed in `eval_enthalpy_R` ({{< code src/thermo/eval_uhs.cpp eval_enthalpy_R >}}); the condensate extra
+$\hat e^{h}_i$ shares the `czh` slot of the species record with the gas compressibility, and is zero at the pin.
+
+**The NASA-9 polynomial** (`use-nasa9-cp`). For a species with a record in `data/nasa9.dat`, two ranges of
+coefficients (below and above a mid-point temperature) give
+$$
+\begin{aligned}
+\hat c_{p,i}(T) &= \frac{a_0}{T^2} + \frac{a_1}{T} + a_2 + a_3 T + a_4 T^2 + a_5 T^3 + a_6 T^4, \\
+\hat h_i(T) &= -\frac{a_0}{T} + a_1 \ln T + a_2 T + \frac{a_3 T^2}{2} + \frac{a_4 T^3}{3} + \frac{a_5 T^4}{4} + \frac{a_6 T^5}{5} + a_7 ,
+\end{aligned}
+$$ {#eq-ch03-caloric-nasa9}
+with $\mathrm d\hat h_i/\mathrm dT = \hat c_{p,i}$ (`[C1]`). @eq-ch03-caloric-nasa9 is computed in `nasa9_cp_R` and
+`nasa9_h_R` ({{< code src/thermo/eval_uhs.cpp nasa9_h_R >}}). The model is used for $c_p$, $c_v = c_p - \mathcal R$
+and the energy, but *not* for the entropy, which stays on the baseline. To keep the energy continuous with the
+baseline and with the offsets of @sec-ch03-reference-state, the internal energy is referenced to $T_0$:
+$$
+\hat u_i(T) = \frac{u^\star_i}{\mathcal R} + \hat c_{v,i}\,T_0 + \bigl[\hat h_i(T) - \hat h_i(T_0)\bigr] - (T - T_0),
+$$ {#eq-ch03-caloric-nasa9-u}
+so that $\hat u_i(T_0)$ is the baseline value and $\mathrm d\hat u_i/\mathrm dT = \hat c_{p,i} - 1$ (`[C2]`).
+@eq-ch03-caloric-nasa9-u is computed in `eval_nasa9` ({{< code src/thermo/eval_uhs.cpp eval_nasa9 >}}), which also
+builds the mask of species that carry a record; species without one stay on the baseline exactly.
+
+**The hydrogen rotor** (`use-h2-cp`). For the species named `H2` the rotational partition function of a rigid rotor
+with levels $\varepsilon_J = \theta_{\mathrm{rot}}\,m_J\,k_{\mathrm B}$, $m_J = J(J+1)$, summed to $J = 40$, gives the
+mean $\langle m \rangle$ and the rotational heat capacity
+$$
+\langle m \rangle = \frac{\sum_J w_J\, m_J\, e^{-\theta_{\mathrm{rot}} m_J/T}}{\sum_J w_J\, e^{-\theta_{\mathrm{rot}} m_J/T}}, \qquad
+\hat c_{v,\mathrm{rot}} = \Bigl(\frac{\theta_{\mathrm{rot}}}{T}\Bigr)^2 \bigl(\langle m^2 \rangle - \langle m \rangle^2\bigr),
+$$ {#eq-ch03-caloric-h2-rot}
+with weights $w_J = 2J+1$ times the nuclear-spin factor: in `equilibrium` mode one Boltzmann ensemble with weight
+$3$ on odd $J$ (ortho) and $1$ on even $J$ (para); in `normal` mode two separate ensembles mixed $1{:}3$ para to ortho,
+so that no conversion heat appears. @eq-ch03-caloric-h2-rot is computed in `h2_rot_reduce`
+({{< code src/thermo/eval_uhs.cpp h2_rot_reduce >}}) and assembled in `eval_h2cp`
+({{< code src/thermo/eval_uhs.cpp eval_h2cp >}}) as
+$$
+\hat c_{p} = \tfrac52 + \hat c_{v,\mathrm{rot}}, \qquad
+\hat u(T) = \frac{u^\star}{\mathcal R} + \hat c_{v}\,T_0 + \tfrac32 (T - T_0) + \theta_{\mathrm{rot}}\bigl(\langle m \rangle(T) - \langle m \rangle(T_0)\bigr),
+$$ {#eq-ch03-caloric-h2-u}
+again continuous with the baseline at $T_0$ and with $\mathrm d\hat u/\mathrm dT = \hat c_p - 1$ (`[C4]`). The
+rotor overrides the NASA-9 record for `H2` when both are on.
+
+**Totals and the inversion.** The per-volume energy and heat capacity are the concentration-weighted sums,
+$U = \mathcal R \sum_i c_i \hat u_i$ and $C_V = \mathcal R \sum_i c_i \hat c_{v,i}$, in
+`ThermoYImpl::_intEng_vol` ({{< code src/thermo/thermo.hpp ThermoYImpl::_intEng_vol >}}) and
+`ThermoYImpl::_cv_vol` ({{< code src/thermo/thermo_y.cpp ThermoYImpl::_cv_vol >}}); $C_p$ and $H$ likewise in
+`ThermoXImpl::_cp_vol` ({{< code src/thermo/thermo.hpp ThermoXImpl::_cp_vol >}}) and `ThermoXImpl::_enthalpy_vol`
+({{< code src/thermo/thermo.hpp ThermoXImpl::_enthalpy_vol >}}). Temperature from energy is the Newton iteration
+$$
+T \leftarrow T + \frac{U - \mathcal R\sum_i c_i \hat u_i(T)}{\mathcal R \sum_i c_i \hat c_{v,i}(T)}, \qquad
+T^{(0)} = \frac{U - \sum_i \rho_i u^\star_i / M_i}{\sum_i \rho_i c_{v,i}/M_i},
+$$ {#eq-ch03-caloric-newton-u}
+whose starting guess is the exact answer of the baseline, so the loop again exits after one pass there;
+@eq-ch03-caloric-newton-u is computed in `ThermoYImpl::_intEng_to_temp`
+({{< code src/thermo/thermo_y.cpp ThermoYImpl::_intEng_to_temp >}}). With an opt-in model the iteration is a true
+Newton method on a convex energy ($c_v > 0$) and stops on the relative change $\varepsilon_{\mathrm{tol}}$ of
+@sec-ch03-eos.
+
+What is exact: the baseline and both opt-in energies as functions of $T$, and the one-step inversion for the baseline.
+What is truncated: the rotor sum at $J = 40$ (the omitted terms are below $e^{-40\cdot41\cdot 87.55/T}$, negligible
+below $3000\,\mathrm K$); the NASA-9 fit outside its $200$ to $6000\,\mathrm K$ range is an extrapolation of the
+polynomial, not data. The check is `caloric_check.py`, whose numbers appear in the Tests layer below.
+
+### Numerical method
+
+@fig-ch03-caloric-h2cp shows the three models for $\mathrm{H_2}$ against temperature. All three are point
+evaluations per cell and species with no stencil; the rotor evaluates $41$ exponentials per cell, the polynomial
+seven powers, and both select their branch (range, or ortho-para weights) with a mask so that species without the
+model keep the baseline bit for bit. The energy-to-temperature loop of @eq-ch03-caloric-newton-u is the only
+iteration, and it runs over all cells at once with the maximum relative change as its stopping test.
+
+```{python}
+#| label: fig-ch03-caloric-h2cp
+#| fig-cap: "Heat capacity at constant pressure of molecular hydrogen under the three caloric models: the constant baseline (dotted black, `cv_R: 2.5` plus one), the NASA-9 polynomial (solid blue, defined from 200 K; drawn to 3000 K), and the rigid rotor in equilibrium ortho-para (solid green, circles) and normal (dashed orange, triangles) modes. The vertical grey line marks the junction temperature of 300 K where the opt-in energies equal the baseline."
+#| fig-alt: "Heat capacity over the gas constant against temperature on a logarithmic axis from 20 to 3000 K. The constant model is a flat line at 3.5. The NASA-9 curve rises from about 3.4 at 200 K to 3.5 near 300 K and above 3.9 by 3000 K. The equilibrium rotor curve starts at 2.5 at 20 K, peaks near 4.6 around 50 K, dips, and settles near 3.5 above 300 K; the normal rotor curve rises smoothly from 2.5 to 3.5 without the peak."
+#| echo: false
+from kintera_report.ch03.figures.fig_caloric_h2cp import make_fig
+make_fig()
+```
+
+The order of overrides inside one evaluation is fixed: the baseline is computed for every species, then the NASA-9
+values replace the masked species, then the rotor replaces the `H2` entry. The entropy functions of
+@sec-ch03-entropy never see either override, which is why the species record warns against enabling
+`use-nasa9-cp` for a condensing vapour.
+
+### Code
+
+| what | code link | symbol | switch |
+|---|---|---|---|
+| $\hat u_i$, @eq-ch03-caloric-u-baseline, @eq-ch03-caloric-nasa9-u | {{< code src/thermo/eval_uhs.cpp eval_intEng_R >}} | `eval_intEng_R` | `use-nasa9-cp`, `use-h2-cp` |
+| $\hat c_{v,i}$ | {{< code src/thermo/eval_uhs.cpp eval_cv_R >}} | `eval_cv_R` | `use-nasa9-cp`, `use-h2-cp` |
+| $\hat c_{p,i}$, @eq-ch03-caloric-cp | {{< code src/thermo/eval_uhs.cpp eval_cp_R >}} | `eval_cp_R` | `use-nasa9-cp`, `use-h2-cp` |
+| $\hat h_i$, @eq-ch03-caloric-h | {{< code src/thermo/eval_uhs.cpp eval_enthalpy_R >}} | `eval_enthalpy_R` | always |
+| NASA-9 forms, @eq-ch03-caloric-nasa9 | {{< code src/thermo/eval_uhs.cpp eval_nasa9 >}} | `eval_nasa9` | `use-nasa9-cp` |
+| rotor sums, @eq-ch03-caloric-h2-rot | {{< code src/thermo/eval_uhs.cpp h2_rot_reduce >}} | `h2_rot_reduce` | `use-h2-cp` |
+| rotor assembly, @eq-ch03-caloric-h2-u | {{< code src/thermo/eval_uhs.cpp eval_h2cp >}} | `eval_h2cp` | `use-h2-cp`, `h2-cp-mode` |
+| `VU->T`, @eq-ch03-caloric-newton-u | {{< code src/thermo/thermo_y.cpp ThermoYImpl::_intEng_to_temp >}} | `ThermoYImpl::_intEng_to_temp` | `max-iter`, `ftol` |
+| per-volume $U$, $C_V$ | {{< code src/thermo/thermo_y.cpp ThermoYImpl::_cv_vol >}} | `ThermoYImpl::_cv_vol` | always |
+| option switches | {{< code src/species.hpp SpeciesThermoImpl::use_nasa9_cp >}} | `SpeciesThermoImpl::use_nasa9_cp` | `reference-state` |
+| NASA-9 record lookup | {{< code src/species.cpp init_species_from_yaml overload=2 >}} | `init_species_from_yaml` | always |
+
+: Code map of the caloric functions. {#tbl-ch03-caloric-code}
+
+Walk-through:
+
+1. Card reading stores `cv_R` (default $5/2$ when absent, which is right only for a monatomic or a
+   translation-only gas) and looks the species name up in `data/nasa9.dat`; a species not in the database gets
+   all-zero coefficients, which is how the mask of `eval_nasa9` later excludes it
+   ({{< code src/species.cpp init_species_from_yaml overload=2 >}}).
+2. The three switches of the `reference-state` block, `use-nasa9-cp`, `use-h2-cp` and `h2-cp-mode`, are read
+   by `ThermoOptionsImpl::from_yaml`
+   ({{< code src/thermo/thermo_options.cpp ThermoOptionsImpl::from_yaml overload=2 >}}); a mode other than
+   `equilibrium` or `normal` throws `Invalid h2-cp-mode`, and an unknown key in the block throws with the closest
+   valid key (`check_reference_state`, {{< code src/species.cpp check_reference_state >}}).
+3. Every caloric call goes through the four `eval_*` functions; the volumetric wrappers of `ThermoY` convert the
+   partial densities to concentrations with `inv_mu` first.
+4. `VU->T` ({{< code src/thermo/thermo_y.cpp ThermoYImpl::_intEng_to_temp >}}) warns `max iterations reached` when
+   the loop does not stop within `max-iter`.
+
+### Tests
+
+| test (ctest name) | what it asserts | tolerance | where the tolerance comes from |
+|---|---|---|---|
+| `tests/test_nasa9_cp.py` (`test_nasa9_cp.py`), `test_nasa9_on_follows_the_polynomial` | `TV->cp`, `VT->cv` equal the polynomial for $\mathrm{H_2}$ and $\mathrm{CH_4}$ at 7 temperatures; $U$ at $300\,\mathrm K$ equals the baseline | rtol $10^{-10}$ ($c_p$, $c_v$), $10^{-12}$ ($U$), $10^{-6}$ (finite-difference $\mathrm dU/\mathrm dT$) | $10^{-10}$: the polynomial in double; $10^{-6}$: central difference with step $10^{-6}T$ |
+| `tests/test_nasa9_cp.py` (`test_nasa9_cp.py`), `test_nasa9_off_keeps_the_constant_cp` | flag off equals flag absent bit for bit; $c_p = c_v + 1$ | rtol $10^{-14}$ | round-off of one addition |
+| `tests/test_h2_cp.py` (`test_h2_cp.py`), `test_equilibrium_mode_has_the_conversion_peak` | $\hat c_p(50\,\mathrm K) = 4.5684$, $\hat c_p(300\,\mathrm K) = 3.4526$ | $2\times10^{-3}$ absolute | set in the test; pins this implementation |
+| `tests/test_h2_cp.py` (`test_h2_cp.py`), `test_normal_mode_freezes_rotation` | $\hat c_p = 2.5000$, $2.5038$, $3.4522$ at $20$, $50$, $300\,\mathrm K$ | $2\times10^{-3}$ absolute | set in the test |
+| `tests/test_thermo.cpp` (`test_thermo`), `DeviceTest.thermo_y`, `DeviceTest.eng_pres` | `VU->T` of `VT->U` returns $T$ | `allclose`, $10^{-4}$ | set in the test; not derived |
+| `src/kintera_report/ch03/checks/caloric_check.py` | $\mathrm d\hat h/\mathrm dT = \hat c_p$ symbolically; the pinned $\mathrm{H_2}$ values; continuity at $T_0$ | symbolic; $2\times10^{-3}$; $10^{-7}$ | algebra; the test's tolerance; central difference |
+
+: Tests of the caloric functions. {#tbl-ch03-caloric-tests}
+
+The two Python files passed in the recorded CPU run of the chapter's Python selection;[^ch03-caloric-pyrun] both run
+each card in its own interpreter because the species registry is global. The check reproduces the pinned rotor
+values to $5\times10^{-5}$ (`[C3]`, well inside the test's $2\times10^{-3}$) and the NASA-9 heat capacity of
+$\mathrm{H_2}$ at $300\,\mathrm K$ as $3.4697$ against the baseline $3.5$. The `DeviceTest` cases passed on CPU and CUDA
+in the recorded CUDA-build run.[^ch03-caloric-run] No test exercises the NASA-9 model on CUDA, and none exercises it
+for a condensing vapour.
+
+[^ch03-caloric-pyrun]: [sha: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45; deck: the cards each test writes;
+    run: `PYTHONPATH=<install-dir> pytest tests/test_equilibrium.py tests/test_nasa9_cp.py tests/test_h2_cp.py tests/test_inline_svp.py tests/test_equilibrate_uv_gain.py tests/test_latent_heat_sign.py tests/test_saturation_adjustment_nh4sh.py tests/test_saturation_degenerate_bound.py tests/test_effective_cp_heap_state.py tests/test_earth.py tests/test_reference_state_keys.py`,
+    CPU, double; 47 passed; Python 3.11.13, torch 2.10.0+cu128, numpy 2.4.6]
+
+[^ch03-caloric-run]: [sha: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45; deck: `tests/jupiter.yaml`; run:
+    `ctest -R 'test_thermo|test_equilibrate_tp_max_iter' -V` in the `tests/` directory of a CUDA build
+    (`cmake -DCUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120`), CPU and CUDA (one RTX 5090), float and double;
+    `test_thermo` 66 passed and 8 skipped (the float instances of `extrapolate_ad` and
+    `equilibrate_uv_depleted_cloud`, and the fixture placeholder); gcc 11.5.0, CUDA 12.9, cmake 3.31.8, libtorch of
+    torch 2.10.0+cu128]
+
+### Limits
+
+::: {.callout-warning title="Limits"}
+- The opt-in models change $c_p$, $c_v$ and $u$ but not the entropy (@sec-ch03-entropy), so a run with
+  `use-nasa9-cp` and a condensing vapour that carries a NASA-9 record has an entropy inconsistent with its energy; the
+  species record says not to combine them, and nothing in the code refuses the combination. Not measured: the size
+  of that inconsistency.
+- `cv_R` defaults to $5/2$ for every species that omits it, condensates included; a condensate without `cv_R` is
+  therefore a monatomic gas in its heat capacity. The latent-heat warning of @sec-ch03-reference-state does not
+  catch this.
+- The NASA-9 coefficients are the bundled database at the pin (one source, no provenance check at load); the rotor
+  constants ($87.55\,\mathrm K$, $J \le 40$) are compiled in and cannot be changed from the card.
+- The extra-function hooks (`intEng_R_extra`, `cp_R_extra`) are read but no function is registered at the
+  pin (@sec-ch03-eos); a card that names one fails at the first evaluation.
+:::

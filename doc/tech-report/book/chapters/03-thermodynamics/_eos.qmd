@@ -1,0 +1,187 @@
+## The ideal-gas equation of state and its inversions (`equation-of-state`) {#sec-ch03-eos}
+
+<!-- PROVENANCE
+pin: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45 (main)
+sources: src/thermo/thermo.hpp, src/thermo/thermo_y.cpp, src/thermo/thermo_x.cpp, src/thermo/thermo_options.cpp, src/thermo/eval_uhs.cpp, src/func_table.cpp, src/species.hpp, tests/test_thermo.cpp
+status: draft
+author: Tianhao Le (happysky19)
+reviewer: Linfeng (requested)
+-->
+
+### Summary
+
+The pressure of a kintera mixture is the ideal-gas pressure of its gases: condensates occupy no volume and exert no
+pressure, and the gas species share the volume. The code writes this with a per-species compressibility factor $z_i$
+in front of each gas concentration, so that a non-ideal gas could be added through a user function; at the code pin
+no such function is registered, and $z_i = 1$ for every gas. This section states the equation of state, the three
+inversions the host codes use (pressure from temperature, temperature from pressure, and concentrations from mole
+fractions) and why two of them are Newton loops that take exactly one step for an ideal gas.
+
+::: {.callout-note title="At a glance"}
+**Purpose.** $p = \mathcal R\,T\sum_{i<N_{\mathrm g}} z_i c_i$, @eq-ch03-eos-pressure, and its inversions.
+
+**Data.** In: $T$ [K] or $p$ [Pa] with the partial densities (`ThermoY`) or the mole fractions (`ThermoX`); out: the
+missing one, or the concentrations $c_i$ [$\mathrm{mol\,m^{-3}}$].
+
+**Placement.** `compute` keys `VT->P`, `PV->T` (`ThermoY`) and `TPX->V` (`ThermoX`); the saturation solvers call
+`VT->P` for their initial guess.
+
+**Activation.** Always. `dynamics/equation-of-state` sets `max-iter` (default 10) and `ftol` (default $10^{-6}$) for the
+Newton loops; `gas_floor` ($10^{-20}\,\mathrm{mol\,m^{-3}}$, not a card key) guards the division by the gas total.
+
+**Guarantee / limits.** Exact for an ideal gas (one Newton step); the damping argument for $z_i \ne 1$ is given but
+untested, since no $z_i \ne 1$ exists at the pin.
+
+**Evidence.** The Tests layer below: `DeviceTest.thermo_y` and `DeviceTest.eng_pres` close the `VT->P`/`PV->T` loop to
+$10^{-4}$.
+:::
+
+Local symbols: $z_i$ the compressibility factor of gas $i$ [-] (`czh`), $z_{i,c} = \partial z_i/\partial c_i$ (`czh_ddC`)
+and $z_{i,T} = \partial z_i/\partial T$; $\hat c_{v,i} = c_{v,i}/\mathcal R$ and $\hat c_{p,i} = c_{p,i}/\mathcal R$
+the dimensionless molar heat capacities (`cv_R`, `cp_R`); $K_{\max}$ the iteration cap (`max-iter`) and
+$\varepsilon_{\mathrm{tol}}$ the relative stopping tolerance (`ftol`). The species symbols are those of
+@sec-ch03-species-state.
+
+### Derivation
+
+Each gas species obeys $p_i = z_i(T, c_i)\,c_i\,\mathcal R\,T$ and the condensates contribute nothing, so the total
+pressure is
+$$
+p = \mathcal R\,T \sum_{i=0}^{N_{\mathrm g}-1} z_i(T, c_i)\,c_i .
+$$ {#eq-ch03-eos-pressure}
+@eq-ch03-eos-pressure is computed in `ThermoYImpl::_temp_to_pres`
+({{< code src/thermo/thermo_y.cpp ThermoYImpl::_temp_to_pres >}}), which converts the partial densities to
+concentrations with `inv_mu` and evaluates $z_i$ through `eval_czh` ({{< code src/thermo/eval_uhs.cpp eval_czh >}}).
+`eval_czh` fills the gas entries with $1$ and then calls the per-species function named in `czh`; at the pin the
+registry of two-argument user functions is empty ({{< code src/func_table.cpp func2_names >}}), so every `czh` entry is
+the empty string and $z_i \equiv 1$ (`[C1]` of `eos_check.py`).
+
+The inverse problem, $T$ from $p$ and the partial densities, is the root of
+$$
+f(T) = T \sum_{i<N_{\mathrm g}} z_i(T, c_i)\,c_i - \frac{p}{\mathcal R} = 0 .
+$$ {#eq-ch03-eos-ftemp}
+Its exact slope is $f'(T) = \sum_i (z_i + T z_{i,T})\,c_i$. The code does not evaluate $z_{i,T}$; it divides by
+$\sum_i (\hat c_{p,i} - \hat c_{v,i})\,c_i$ instead and takes the step
+$$
+T \leftarrow T - \frac{f(T)}{\sum_{i<N_{\mathrm g}} (\hat c_{p,i} - \hat c_{v,i})\,c_i},
+\qquad T^{(0)} = \frac{p}{\mathcal R \sum_i c_i} .
+$$ {#eq-ch03-eos-newton-t}
+@eq-ch03-eos-newton-t is computed in `ThermoYImpl::_pres_to_temp`
+({{< code src/thermo/thermo_y.cpp ThermoYImpl::_pres_to_temp >}}). Why this denominator is safe: for a gas whose
+compressibility depends on $T$ and $c$, the Mayer relation reads $\hat c_p - \hat c_v = (z + T z_T)^2 / (z + c\,z_c)$,
+and with $z_T \ge 0$, $z_c \le 0$ (a dissociating gas) that is at least the exact slope $z + T z_T$, so the step is
+never longer than the Newton step: a damped Newton iteration that cannot overshoot the root (`[C3]`). For an ideal gas
+$\hat c_p - \hat c_v = 1$, $f'(T) = \sum c_i$, and the starting guess $T^{(0)}$ is already the root, so $f(T^{(0)}) = 0$
+and the loop exits after its first pass (`[C2]`). The sign of the step matters: $f$ increases with $T$, so the
+correction is subtracted.
+
+The third inversion gives concentrations from $(T, p, x)$. For gases, @eq-ch03-eos-pressure with
+$p_i = p\,x_i/x_{\mathrm g}$ is the fixed-point problem $z_i(T, c_i)\,c_i = c_i^{\mathrm{id}}$ with the ideal value
+$c_i^{\mathrm{id}} = x_i p / (x_{\mathrm g}\mathcal R T)$ of @eq-ch03-species-state-conc, solved per species by
+$$
+c_i \leftarrow c_i + \frac{c_i^{\mathrm{id}} - z_i c_i}{z_{i,c}\,c_i + z_i}, \qquad c_i^{(0)} = c_i^{\mathrm{id}} .
+$$ {#eq-ch03-eos-newton-c}
+@eq-ch03-eos-newton-c is computed in `ThermoXImpl::_xfrac_to_conc`
+({{< code src/thermo/thermo_x.cpp ThermoXImpl::_xfrac_to_conc >}}) with $z_{i,c}$ from `eval_czh_ddC`
+({{< code src/thermo/eval_uhs.cpp eval_czh_ddC >}}); with $z_i = 1$, $z_{i,c} = 0$ the update is zero at the start
+and the loop again exits after one pass (`[C4]`). The condensate concentrations follow from the reference gas,
+$c_i = c_0 x_i / x_0$.
+
+Nothing is truncated for an ideal gas: all three relations are closed forms and the loops reproduce them to
+round-off. For $z_i \ne 1$ the two Newton loops stop when the largest relative change of the unknown falls below
+$\varepsilon_{\mathrm{tol}}$ or after $K_{\max}$ passes, with a warning in the second case; the damping makes the
+temperature loop monotone but the convergence order for $z_i \ne 1$ is not established here, because no such $z_i$
+exists at the pin. The executable check is `eos_check.py` (`[C1]` to `[C5]`).
+
+### Numerical method
+
+@fig-ch03-eos-conversions places the three inversions among the other conversion keys of the two modules. Each key
+is one call; the solid arrows are closed forms and the dashed ones are the loops of this section and of
+@sec-ch03-caloric and @sec-ch03-entropy. All keys act element-wise over the leading (cell) axes of the tensors, so a
+column, a plane or a whole grid is one call; the stopping test of a loop is the *maximum* relative change over all
+cells, so one slowly converging cell makes every cell iterate.
+
+```{python}
+#| label: fig-ch03-eos-conversions
+#| fig-cap: "The conversion keys of `ThermoY` (a, mass basis) and `ThermoX` (b, mole basis) as a graph: nodes are the state quantities (D density, Y mass fractions, V partial densities or concentrations, T, P, U internal energy, S entropy, H enthalpy, cv and cp heat capacities), each arrow is one `compute` key from its inputs to its output. Solid green arrows are closed forms; dashed vermillion arrows are Newton loops (`PV->T`, `VU->T`, `TPX->V`, `PXS->T`). Keys with several inputs are drawn from the input they iterate on or are named after."
+#| fig-alt: "Two panels of circles connected by labelled arrows. In panel (a) the nodes D,Y; V; T; P; U; S; cv are linked by the keys DY->V, PV->T, VT->P, VT->U, VU->T, PVT->S and VT->cv. In panel (b) the nodes X; V; D; T; H; S; cp are linked by TPX->V, V->D, TV->H, TV->cp, TPV->S and PXS->T. Four arrows are dashed to mark iterative keys."
+#| echo: false
+from kintera_report.ch03.figures.fig_eos_conversions import make_fig
+make_fig()
+```
+
+The loops share one shape. The starting guess is the ideal-gas closed form; one pass evaluates the user hooks
+($z_i$, $z_{i,c}$, or the heat capacities) on the current iterate for all cells at once; the update is applied in
+place; the test $\max_{\mathrm{cells}} |1 - X_{\mathrm{pre}}/X| < \varepsilon_{\mathrm{tol}}$ ends the loop.
+The loop variable $X$ is $T$ in `PV->T` and $c_i$ in `TPX->V`. Reaching $K_{\max}$ prints a warning
+(`max iterations reached`) and returns the last iterate; `TPX->V` additionally writes the offending inputs to a
+`.pt` file named after the time stamp, which is the one side effect on disk in this chapter. The gas concentrations
+are floored at `gas_floor` before the division by their sum, so a cell without any gas returns a finite (and
+meaningless) temperature instead of a division by zero (`[C5]`).
+
+### Code
+
+| what | code link | symbol | switch |
+|---|---|---|---|
+| `VT->P`, @eq-ch03-eos-pressure | {{< code src/thermo/thermo_y.cpp ThermoYImpl::_temp_to_pres >}} | `ThermoYImpl::_temp_to_pres` | always |
+| `PV->T`, @eq-ch03-eos-newton-t | {{< code src/thermo/thermo_y.cpp ThermoYImpl::_pres_to_temp >}} | `ThermoYImpl::_pres_to_temp` | `max-iter`, `ftol` |
+| `TPX->V`, @eq-ch03-eos-newton-c | {{< code src/thermo/thermo_x.cpp ThermoXImpl::_xfrac_to_conc >}} | `ThermoXImpl::_xfrac_to_conc` | `max-iter`, `ftol` |
+| compressibility $z_i$ | {{< code src/thermo/eval_uhs.cpp eval_czh >}} | `eval_czh` | `czh` (none registered) |
+| $\partial z_i/\partial c_i$ | {{< code src/thermo/eval_uhs.cpp eval_czh_ddC >}} | `eval_czh_ddC` | `czh_ddC` (none registered) |
+| user-function registry | {{< code src/func_table.cpp func2_names >}} | `func2_names` | always |
+| loop controls from the card | {{< code src/thermo/thermo_options.cpp ThermoOptionsImpl::from_yaml overload=2 >}} | `ThermoOptionsImpl::from_yaml` | `dynamics/equation-of-state` |
+| defaults | {{< code src/thermo/thermo.hpp ThermoOptionsImpl::max_iter >}} | `ThermoOptionsImpl::max_iter` | always |
+| gas floor | {{< code src/thermo/thermo.hpp ThermoOptionsImpl::gas_floor >}} | `ThermoOptionsImpl::gas_floor` | always |
+
+: Code map of the equation of state and its inversions. {#tbl-ch03-eos-code}
+
+Walk-through:
+
+1. The card's `dynamics: {equation-of-state: {max-iter: 10, ftol: 1.e-6}}` block is read by
+   `ThermoOptionsImpl::from_yaml` ({{< code src/thermo/thermo_options.cpp ThermoOptionsImpl::from_yaml overload=2 >}});
+   both keys are optional and the same two numbers also bound the saturation solvers of @sec-ch04. The block is the
+   hydrodynamic host's (its other keys, such as `density-floor`, are not read here).
+2. `VT->P` ({{< code src/thermo/thermo_y.cpp ThermoYImpl::_temp_to_pres >}}): gas concentrations from `inv_mu`, $z_i$
+   from `eval_czh`, one reduction over the gas axis.
+3. `PV->T` ({{< code src/thermo/thermo_y.cpp ThermoYImpl::_pres_to_temp >}}): floor, closed-form guess, then the loop
+   of @eq-ch03-eos-newton-t with `eval_cv_R` and `eval_cp_R` (@sec-ch03-caloric) for the denominator.
+4. `TPX->V` ({{< code src/thermo/thermo_x.cpp ThermoXImpl::_xfrac_to_conc >}}): ideal guess floored at `gas_floor`,
+   the loop of @eq-ch03-eos-newton-c, then the condensate scaling.
+
+### Tests
+
+| test (ctest name) | what it asserts | tolerance | where the tolerance comes from |
+|---|---|---|---|
+| `tests/test_thermo.cpp` (`test_thermo`), `DeviceTest.thermo_y` | `PV->T` of `VT->P` returns $T$ | `allclose`, $10^{-4}$ | set in the test; not derived |
+| `tests/test_thermo.cpp` (`test_thermo`), `DeviceTest.eng_pres` | `VT->P` of the mass basis equals the $p$ that `TPX->V` of the mole basis started from | `allclose`, $10^{-4}$ | set in the test; not derived |
+| `tests/test_thermo.cpp` (`test_thermo`), `DeviceTest.thermo_x` | `V->D` of `TPX->V` is $\sum c_i M_i$ | `allclose`, $10^{-4}$ | set in the test; not derived |
+| `src/kintera_report/ch03/checks/eos_check.py` | one-step convergence for $z_i = 1$; the damping ratio $\ge 1$ | exact ($0$ step), symbolic | algebra |
+
+: Tests of the equation of state. {#tbl-ch03-eos-tests}
+
+All three `DeviceTest` cases run on CPU and CUDA in float and double and passed in the recorded CUDA-build
+run.[^ch03-eos-run] No test exercises $z_i \ne 1$: at the pin none can, since no two-argument user function is
+registered (`func2_names` is empty). The damping property of @eq-ch03-eos-newton-t is therefore verified
+symbolically in `eos_check.py` (`[C3]`) and marked untested in the Limits layer below.
+
+[^ch03-eos-run]: [sha: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45; deck: `tests/jupiter.yaml`; run:
+    `ctest -R 'test_thermo|test_vapor_functions|test_equilibrate_tp_max_iter|test_equilibrium.release|test_species|test_reaction'`
+    in the `tests/` directory of a CUDA build (`cmake -DCUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120`), CPU and CUDA (one
+    RTX 5090), float and double; 6 of 6 binaries passed; gcc 11.5.0, CUDA 12.9, cmake 3.31.8, libtorch of
+    torch 2.10.0+cu128, Python 3.11.13]
+
+### Limits
+
+::: {.callout-warning title="Limits"}
+- Only ideal gases exist at the pin: the `czh`, `czh_ddC`, `intEng_R_extra`, `cp_R_extra` and `entropy_R_extra` hooks
+  of the species record ({{< code src/species.hpp SpeciesThermoImpl::czh >}}) accept a function name, but the registry
+  they are looked up in is empty, so any non-empty name throws `Function ... not registered` at the first conversion.
+  A non-ideal equation of state is a planned extension point, not a feature.
+- The Newton loops stop on a relative change, not on the residual, and return the last iterate after `max-iter` with
+  only a warning; a host that ignores standard error cannot tell. Not measured: how many passes a $z_i \ne 1$ gas
+  would need.
+- Condensates take no volume. Dense clouds in a small volume therefore have the pressure of their gas alone; the
+  error of that approximation for a given cloud load is not measured here.
+- The `.pt` dump of `TPX->V` on failure is written to the working directory with a time-stamp name and cannot be
+  turned off.
+:::

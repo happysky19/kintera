@@ -1,0 +1,162 @@
+## The saturation ratio (`relative_humidity`) {#sec-ch03-relative-humidity}
+
+<!-- PROVENANCE
+pin: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45 (main)
+sources: src/thermo/relative_humidity.cpp, src/thermo/relative_humidity.hpp, src/thermo/nucleation.cpp, src/thermo/log_svp.hpp, python/csrc/pythermo.cpp, tests/test_thermo.cpp, tests/test_reaction_equilibrium.py, tests/test_inline_svp.py
+status: draft
+author: Tianhao Le (happysky19)
+reviewer: Linfeng (requested)
+-->
+
+### Summary
+
+The saturation ratio of a phase-change reaction is the quotient of its gas partial pressures divided by the
+equilibrium quotient at the same temperature: above one the gases are supersaturated and the condensate forms,
+below one the condensate evaporates. For a single vapour condensing to a pure phase it is the relative humidity of
+meteorology, which gives the function its name; kintera's version handles any reaction of the nucleation type,
+including products of several partial pressures (ammonium hydrosulfide) and reactions with a gaseous product. It is
+a diagnostic, evaluated after a saturation adjustment to check how close each reaction is to equilibrium; the
+solvers of @sec-ch04 use the same quotient internally, in logarithmic form.
+
+::: {.callout-note title="At a glance"}
+**Purpose.** $\varphi_j = Q_j / Q_j^{\mathrm{sat}}(T)$ per reaction, @eq-ch03-relative-humidity-ratio.
+
+**Data.** In: $T$ [K], concentrations $c_i$ [$\mathrm{mol\,m^{-3}}$], the stoichiometric matrix, the nucleation
+options and, for cards with gaseous products, the number of gases; out: $\varphi_j$ [-], shape $(\dots, N_{\mathrm r})$.
+
+**Placement.** A free function (`kintera.relative_humidity`), called by the examples and tests after `forward`.
+
+**Activation.** Always available; the argument `ngas` defaults to $-1$ (legacy: all reactants, condensates
+included at unit activity) and must be given when a reaction has a gaseous product, or the call raises.
+
+**Guarantee / limits.** Exact algebra on the ideal-gas partial pressures; zero amounts give $0$, $\infty$ or
+`nan`, never an exception.
+
+**Evidence.** The Tests layer below: `test_antoine_equilibrate_tp_saturates` holds
+$|\varphi - 1| < 10^{-8}$ in cloudy cells.
+:::
+
+Local symbols: $\varphi_j$ the saturation ratio of reaction $j$ [-]; $Q_j = \prod_{i<N_{\mathrm g}} p_i^{a_{ij}}$ its
+gas-pressure quotient in Pa to the power $A_j$; $A_j = \sum_{i<N_{\mathrm g}} a_{ij}$ the net number of gas moles
+consumed; $L_j(T) = \ln Q_j^{\mathrm{sat}}$ as in @sec-ch03-entropy. The name `relative_humidity` is kept in the
+heading because it is the API name; the quantity is a saturation ratio.
+
+### Derivation
+
+With $p_i = c_i\mathcal R T$ for each gas and unit activity for every pure condensate, the quotient of reaction $j$
+over its saturation value is
+$$
+\varphi_j = \frac{\prod_{i<N_{\mathrm g}} (c_i \mathcal R T)^{a_{ij}}}{\exp L_j(T)}
+= \frac{\prod_{i<N_{\mathrm g}} c_i^{a_{ij}}}{\exp\bigl(L_j(T) - A_j \ln(\mathcal R T)\bigr)} ,
+$$ {#eq-ch03-relative-humidity-ratio}
+and the second form, which moves the $(\mathcal R T)^{A_j}$ into the denominator, is what the code evaluates:
+@eq-ch03-relative-humidity-ratio is computed in `relative_humidity`
+({{< code src/thermo/relative_humidity.cpp relative_humidity >}}) with $L_j$ from `LogSVPFunc::call`
+({{< code src/thermo/log_svp.hpp LogSVPFunc::call >}}). The equivalence of the two forms is `[C1]` of
+`relative_humidity_check.py`. For $\mathrm{NH_3 + H_2S \rightleftharpoons NH_4SH(s)}$, $a = 1$ for both gases and
+$A_j = 2$, so $\varphi$ is a product of two partial pressures over a constant with the units of $\mathrm{Pa^2}$, which
+is why $L_j$ must be stated in Pa (@sec-ch04).
+
+The exponent matrix is where the gaseous products matter. Without `ngas` the code takes $a_{ij} = |\min(\nu_{ij}, 0)|$
+over *all* species: every reactant, which is right only when all products are condensates (unit activity) and is
+the legacy meaning of the function. With `ngas` it takes $a_{ij} = -\nu_{ij}$ over the first `ngas` rows and zero
+below, so that a gaseous product such as $\mathrm{H_2}$ in $\mathrm{Mn + H_2S \rightleftharpoons MnS(s) + H_2}$ enters
+with exponent $-1$ (`[C2]`). The function refuses the legacy call for options whose builder has recorded a gaseous
+product (`has_gas_products`, set by `add_to_vapor_cloud` in @sec-ch03-species-state), with the message
+`relative_humidity requires ngas for gaseous reaction products`.
+
+Zero amounts are not special-cased: a zero reactant concentration makes $\varphi_j = 0$, a zero gaseous product makes
+it infinite, and both at once make it `nan` (`[C4]`); the solvers of @sec-ch04 treat the last case as a blocked
+reaction rather than evaluating the quotient. Nothing is truncated: the relation is exact for ideal gases, and the
+check `relative_humidity_check.py` holds it symbolically and on a water example (`[C3]`: $1\,\mathrm{mol\,m^{-3}}$ of
+water vapour at $300\,\mathrm K$ has $\varphi = 0.7047$ against the `h2o_ideal` curve, whose saturation pressure there
+is $3539.5\,\mathrm{Pa}$).
+
+### Numerical method
+
+The evaluation is element-wise over cells and reactions: one `LogSVPFunc::call` for all reactions (the same
+vectorised evaluation @sec-ch03-entropy uses), one broadcast power and product over the species axis, one
+exponential. @fig-ch03-relative-humidity-quotient shows the ratio for two reactions at fixed gas concentrations
+across temperature; the slope of each curve on the logarithmic axis is $-\mathrm dL_j/\mathrm dT + A_j/T$, which is
+the temperature sensitivity the fixed-energy solver of @sec-ch04 linearises. There is no tolerance
+and no iteration.
+
+```{python}
+#| label: fig-ch03-relative-humidity-quotient
+#| fig-cap: "Saturation ratio against temperature at fixed gas concentrations for a single-vapour reaction (water, `h2o_ideal`, solid blue) and a two-vapour reaction (ammonium hydrosulfide, `nh3_h2s_lewis`, dashed green), on a logarithmic axis. The dotted vermillion line is the ratio one: above it the condensate forms, below it it evaporates. The two-vapour curve is steeper because its quotient carries two partial pressures."
+#| fig-alt: "Two decreasing curves of saturation ratio against temperature from 150 to 320 K on a logarithmic axis spanning ten decades, both crossing a horizontal dotted line at one; the ammonium hydrosulfide curve crosses near 200 K and falls faster than the water curve, which crosses near 280 K."
+#| echo: false
+from kintera_report.ch03.figures.fig_relative_humidity_quotient import make_fig
+make_fig()
+```
+
+### Code
+
+| what | code link | symbol | switch |
+|---|---|---|---|
+| the ratio, @eq-ch03-relative-humidity-ratio | {{< code src/thermo/relative_humidity.cpp relative_humidity >}} | `relative_humidity` | `ngas` |
+| declaration and default `ngas = -1` | {{< code src/thermo/relative_humidity.hpp relative_humidity >}} | `relative_humidity` | always |
+| $L_j(T)$ | {{< code src/thermo/log_svp.hpp LogSVPFunc::call >}} | `LogSVPFunc::call` | always |
+| gas-product flag | {{< code src/thermo/nucleation.cpp add_to_vapor_cloud >}} | `add_to_vapor_cloud` | `phase: gas` |
+| Python binding | {{< code python/csrc/pythermo.cpp bind_thermo >}} | `bind_thermo` | always |
+
+: Code map of the saturation ratio. {#tbl-ch03-relative-humidity-code}
+
+Walk-through:
+
+1. `LogSVPFunc::init` with the card's nucleation options, then `call` for $L_j(T)$ over all cells.
+2. Two argument checks: `ngas` is required when `has_gas_products` is set, and must lie in $[-1, N]$ (`Invalid gas
+   species count`).
+3. The exponent matrix is built from `stoich` as described, the power-product over the species axis is taken and
+   divided by $\exp(L_j - A_j\ln\mathcal R T)$.
+
+In Python, after a saturation adjustment of the mole basis (the deep-Jupiter example does exactly this):
+
+```python
+from kintera import relative_humidity
+conc = tx.compute("TPX->V", [temp, pres, xfrac])
+ngas = len(tx.options.vapor_ids())
+phi = relative_humidity(temp, conc, tx.buffer("stoich"),
+                        tx.options.nucleation(), ngas)
+```
+
+### Tests
+
+| test (ctest name) | what it asserts | tolerance | where the tolerance comes from |
+|---|---|---|---|
+| `tests/test_thermo.cpp` (`test_thermo`), `DeviceTest.relative_humidity` | after `forward`, $\min\varphi \le 1$ and $\max\varphi \ge 0$ on CPU and CUDA | none beyond the inequalities | smoke |
+| `tests/test_inline_svp.py` (`test_inline_svp.py`), `test_antoine_logsvp_analytic` | $\varphi$ for $1\,\mathrm{mol\,m^{-3}}$ equals $\mathcal R T / p_{\mathrm{sat}}$ for an Antoine curve | $10^{-12}$ relative | double-precision evaluation of one exponential |
+| `tests/test_inline_svp.py` (`test_inline_svp.py`), `test_antoine_equilibrate_tp_saturates` | $|\varphi - 1| < 10^{-8}$ in every cloudy cell after `forward`; $\varphi < 1$ in the others | $10^{-8}$ | the solver's `ftol` of $10^{-12}$ in the log quotient, with margin |
+| `tests/test_reaction_equilibrium.py` (`test_reaction_equilibrium.py`), `test_rh_requires_explicit_gas_count` | the legacy call raises for a gas-product card; doubling the $\mathrm{H_2}$ concentration halves $\varphi$ | `assert_close` default | the division is exact algebra |
+| `tests/test_inline_svp.py` (`test_inline_svp.py`), `test_ideal_logsvp_bitwise` | inline and named curves give bit-identical $\varphi$ | exact | bit comparison |
+| `src/kintera_report/ch03/checks/relative_humidity_check.py` | the two forms of the ratio; the exponent masks; zero amounts | symbolic; exact | algebra |
+
+: Tests of the saturation ratio. {#tbl-ch03-relative-humidity-tests}
+
+`test_inline_svp.py` passed in the recorded CPU run,[^ch03-relative-humidity-pyrun] `test_reaction_equilibrium.py`
+in the recorded CPU and CUDA run,[^ch03-relative-humidity-cuda] and the `DeviceTest` case in the recorded CUDA-build
+run.[^ch03-relative-humidity-run]
+
+[^ch03-relative-humidity-pyrun]: [sha: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45; deck: the cards each test
+    writes; run: `PYTHONPATH=<install-dir> pytest tests/test_equilibrium.py tests/test_nasa9_cp.py tests/test_h2_cp.py tests/test_inline_svp.py tests/test_equilibrate_uv_gain.py tests/test_latent_heat_sign.py tests/test_saturation_adjustment_nh4sh.py tests/test_saturation_degenerate_bound.py tests/test_effective_cp_heap_state.py tests/test_earth.py tests/test_reference_state_keys.py`,
+    CPU, double; 47 passed; Python 3.11.13, torch 2.10.0+cu128, numpy 2.4.6]
+
+[^ch03-relative-humidity-cuda]: [sha: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45; deck: the cards each test
+    writes; run: `PYTHONPATH=<install-dir> pytest tests/test_cuda_workspace.py tests/test_reaction_equilibrium.py tests/test_warm_start_shape.py tests/test_thermo_x_warm_start_shape.py tests/test_saturation_failure_reported.py`,
+    CPU and CUDA (one RTX 5090), float and double; 135 passed; Python 3.11.13, torch 2.10.0+cu128, numpy 2.4.6]
+
+[^ch03-relative-humidity-run]: [sha: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45; deck: `tests/jupiter.yaml`;
+    run: `ctest -R 'test_thermo|test_equilibrate_tp_max_iter' -V` in the `tests/` directory of a CUDA build
+    (`cmake -DCUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120`), CPU and CUDA (one RTX 5090), float and double; `test_thermo`
+    66 passed, 8 skipped; gcc 11.5.0, CUDA 12.9, cmake 3.31.8, libtorch of torch 2.10.0+cu128]
+
+### Limits
+
+- Ideal gas only: the source carries a note to correct the ratio for a non-ideal gas, and the compressibility
+  factor of @sec-ch03-eos does not enter here even if one were registered.
+- The legacy call (no `ngas`) is silently wrong for a card whose gaseous product was not declared with
+  `phase: gas`, because then `has_gas_products` is never set and the product is treated as a condensate of unit
+  activity.
+- `minT` and `maxT` of the reaction are not consulted: the curve is evaluated wherever it is asked, including
+  outside its fit range.
+- Not measured: the cost of the power-product for cards with many reactions.

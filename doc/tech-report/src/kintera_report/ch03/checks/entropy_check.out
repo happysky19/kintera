@@ -1,0 +1,6 @@
+[C1] PASS gas entropy: - ln p - ln x_i^g = - ln p_i (difference 0)
+[C2] PASS condensate entropy: exact - code b_j = 0 on the saturation curve
+[C3] PASS pinv(S+^T) b: one-to-one block max |s - b| = 0.0e+00; shared block returns the minimum-norm split [-2.5, -2.5]
+[C4] PASS h/R - u/R = 250.0 K (gas, = T), 0.0 K (condensate)
+[C5] PASS H2O(l) at 280 K: s_c/R = -9.3427, saturated vapour s_v/R = 4.3716, (s_v - s_c) R T = 31927.5 J mol^-1 = h_v - h_c = 31927.5 J mol^-1
+entropy_check: 5 of 5 passed

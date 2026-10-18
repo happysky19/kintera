@@ -1,0 +1,204 @@
+## Entropy, enthalpy and the free energies (`PVT->S`, `TPV->S`) {#sec-ch03-entropy}
+
+<!-- PROVENANCE
+pin: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45 (main)
+sources: src/thermo/eval_uhs.cpp, src/thermo/thermo.hpp, src/thermo/thermo_x.cpp, src/thermo/thermo_y.cpp, src/thermo/log_svp.hpp, tests/test_thermo.cpp, tests/test_thermo_none_nucleation.py
+status: draft
+author: Tianhao Le (happysky19)
+reviewer: Linfeng (requested)
+-->
+
+### Summary
+
+The entropy is what the adiabat routines of @sec-ch03-adiabat conserve and what a host code uses to place a
+parcel on an adiabat, so it has to be consistent with the energies of @sec-ch03-caloric and with the saturation
+curves of @sec-ch04. For a gas kintera uses the ideal-gas entropy at the species' partial pressure. For a
+condensate it does not use a card value at all: it derives the condensate entropy from the condition that the
+Gibbs energy change of each phase-change reaction vanishes on its saturation curve, which makes the entropy
+consistent with the saturation curve by construction. This section gives both formulas, the pseudo-inverse that
+solves the condensate system, and the inversion from entropy to temperature that `ThermoX` offers.
+
+::: {.callout-note title="At a glance"}
+**Purpose.** $s_i(T, p, x)$ per species, @eq-ch03-entropy-gas and @eq-ch03-entropy-condensate, and the per-volume
+$S = \sum_i c_i s_i$; the Gibbs energy $G = H - TS$ and the Helmholtz energy $F = U - TS$.
+
+**Data.** In: $T$ [K], $p$ [Pa], concentrations $c_i$ [$\mathrm{mol\,m^{-3}}$] (or partial densities); out:
+$S$ [$\mathrm{J\,m^{-3}\,K^{-1}}$], $G$ and $F$ [$\mathrm{J\,m^{-3}}$].
+
+**Placement.** `compute` keys `PVT->S` (`ThermoY`), `TPV->S`, `PXS->T`, `THS->G` (`ThermoX`), `TUS->F` (`ThermoY`);
+inside `extrapolate_dlnp` and `extrapolate_dz`.
+
+**Activation.** Always; the condensate branch needs the nucleation reactions of the card (@sec-ch04). With
+no reactions `TPV->S` is the gas formula alone.
+
+**Guarantee / limits.** Exact for ideal gases with constant heat capacities; the condensate entropy is exact when each
+condensate appears in one reaction and a minimum-norm solution otherwise. The entropy ignores the opt-in heat
+capacities of @sec-ch03-caloric.
+
+**Evidence.** The Tests layer below: `DeviceTest.thermo_x` closes `PXS->T` to $10^{-4}$; `test_thermo_none_nucleation.py`.
+:::
+
+Local symbols: $L_j(T) = \ln Q_j^{\mathrm{sat}}$ the logarithm of the saturation quotient of reaction $j$ (the
+`logsvp` function of the card; defined in @sec-ch04); $a_{ij} = -\nu_{ij}$ for a gas reactant;
+$\mathsf S^{+}$ the condensate block of the stoichiometric matrix ($N_{\mathrm c} \times N_{\mathrm r}$, `sp`);
+$b_j$ the right-hand side of the condensate system; $N_{\mathrm r}$ the number of nucleation reactions. The energy
+and reference symbols are those of @sec-ch03-caloric and @sec-ch03-reference-state.
+
+### Derivation
+
+**Gases.** An ideal gas with constant heat capacity at its partial pressure $p_i = p\,x_i/x_{\mathrm g}$ has
+$$
+\hat s_i = \frac{s^\star_i}{\mathcal R} + \hat c_{p,i}\ln T - \ln p - \ln\frac{c_i}{c_{\mathrm g}} + \hat e^{s}_i
+\quad (i < N_{\mathrm g}),
+$$ {#eq-ch03-entropy-gas}
+where $c_i/c_{\mathrm g} = x_i/x_{\mathrm g}$ is the gas-only mole fraction, clamped below at $10^{-300}$ before the
+logarithm so that an absent gas gives a large finite entropy instead of infinity, and $\hat e^{s}_i$ is the optional
+`entropy_R_extra` hook (none registered at the pin). @eq-ch03-entropy-gas is computed in the two overloads of
+`eval_entropy_R` ({{< code src/thermo/eval_uhs.cpp eval_entropy_R overload=2 >}}); the first overload, taking the
+species record alone, evaluates only this gas part. That $-\ln p - \ln(x_i/x_{\mathrm g}) = -\ln p_i$ is `[C1]` of
+`entropy_check.py`.
+
+**Condensates.** On the saturation curve of reaction $j$ the Gibbs energy change vanishes, $\sum_i \nu_{ij} g_i = 0$
+with $g_i = h_i - T s_i$. Splitting the sum into gases and condensates and solving for the condensate part,
+$$
+\sum_{i \ge N_{\mathrm g}} \nu_{ij}\,\hat s_i
+= \frac{1}{T}\sum_{i} \nu_{ij}\,\hat h_i - \sum_{i < N_{\mathrm g}} \nu_{ij}\,\hat s_i .
+$$
+The gas entropies on the right are those of @eq-ch03-entropy-gas evaluated *on the saturation curve*, where
+$\sum_{i<N_{\mathrm g}} a_{ij}\ln p_i = L_j(T)$ (@sec-ch04), so that
+$-\sum_{i<N_{\mathrm g}} \nu_{ij}\ln p_i = L_j$ and the partial pressures drop out:
+$$
+b_j \equiv \sum_{i \ge N_{\mathrm g}} \nu_{ij}\,\hat s_i
+= \frac{1}{T}\sum_{i} \nu_{ij}\,\hat h_i - \sum_{i < N_{\mathrm g}} \nu_{ij}\Bigl(\frac{s^\star_i}{\mathcal R} + \hat c_{p,i}\ln T + \hat e^{s}_i\Bigr) - L_j(T) .
+$$ {#eq-ch03-entropy-b}
+@eq-ch03-entropy-b is computed in `eval_entropy_R` ({{< code src/thermo/eval_uhs.cpp eval_entropy_R overload=2 >}}),
+which evaluates $L_j$ through `LogSVPFunc::call` ({{< code src/thermo/log_svp.hpp LogSVPFunc::call >}}) and the
+enthalpies through `eval_enthalpy_R` of @sec-ch03-caloric (`[C2]`). The condensate entropies are then the solution
+of the linear system $(\mathsf S^{+})^{\mathrm T}\,\hat{\mathbf s}_{\mathrm c} = \mathbf b$,
+$$
+\hat{\mathbf s}_{\mathrm c} = \bigl[(\mathsf S^{+})^{\mathrm T}\bigr]^{+}\,\mathbf b ,
+$$ {#eq-ch03-entropy-condensate}
+with the Moore-Penrose pseudo-inverse $[\cdot]^+$, computed in the same `eval_entropy_R` through `torch.linalg.pinv`.
+When every condensate is the product of exactly one reaction with coefficient one, as in `tests/jupiter.yaml`,
+$\mathsf S^{+}$ is a permutation of the identity and $\hat s_{\mathrm c,i} = b_j$ exactly; when a condensate appears
+in several reactions, or several condensates share one, the pseudo-inverse returns the least-squares, minimum-norm
+solution (`[C3]`). The condensate's own `s0_R` never enters, which is why @sec-ch03-reference-state zeroes it.
+
+The construction makes the entropy consistent with the saturation curve whatever the card's offsets: by
+@eq-ch03-entropy-b the gap $T(s_v - s_c)$ between a vapour at its saturation partial pressure and its condensate
+equals $h_v - h_c$ exactly, which @fig-ch03-entropy-condensate shows for water. Whether that $h_v - h_c$ is the
+latent heat the saturation curve implies is the Kirchhoff question of @sec-ch03-reference-state.
+
+**Free energies and the inversion.** The per-volume totals are $S = \mathcal R\sum_i c_i \hat s_i$ in
+`ThermoYImpl::_entropy_vol` ({{< code src/thermo/thermo.hpp ThermoYImpl::_entropy_vol >}}) and
+`ThermoXImpl::_entropy_vol` ({{< code src/thermo/thermo.hpp ThermoXImpl::_entropy_vol >}}), then $G = H - TS$
+(`THS->G`) and $F = U - TS$ (`TUS->F`) in the `compute` dispatch. Temperature from a target entropy at fixed pressure
+and mole fractions is the iteration
+$$
+T \leftarrow T\Bigl(1 + \frac{S_{\mathrm{target}} - S(T)}{C_p(T)}\Bigr), \qquad T^{(0)} = T_\star,
+$$ {#eq-ch03-entropy-newton}
+followed in each pass by a saturation adjustment of the mole fractions at the new temperature (`forward`,
+@sec-ch04), so that the entropy target is met on the equilibrium composition.
+@eq-ch03-entropy-newton is computed in `ThermoXImpl::_entropy_to_temp`
+({{< code src/thermo/thermo_x.cpp ThermoXImpl::_entropy_to_temp >}}). It is the Newton step on
+$S(T) - S_{\mathrm{target}}$ with $\partial S/\partial T = C_p/T$ at fixed pressure, linearised in $T$ (the same
+form as the adiabat update of @sec-ch03-adiabat, whose check `adiabat_check.py` `[C4]` gives its remainder).
+
+Exact: the gas entropy, and the condensate entropy for one-to-one reaction blocks. Approximate: the minimum-norm
+split for shared condensates has no thermodynamic meaning beyond reproducing $b_j$; the iteration
+@eq-ch03-entropy-newton is first order in its step and stops on the relative change of $T$.
+
+### Numerical method
+
+@fig-ch03-entropy-condensate shows the two entropies of water over temperature and the identity that the
+construction enforces. The condensate solve is one `pinv` of an $N_{\mathrm r} \times N_{\mathrm c}$ matrix that
+depends only on the stoichiometry, broadcast over all cells, followed by one matrix-vector product per cell; the
+matrix is small (three by three for the Jupiter card) and the cost is in the $L_j(T)$ and enthalpy evaluations. The
+`PXS->T` loop starts every cell at $T_\star$ (not at the previous temperature), calls the full saturation solver
+once per pass, and stops on the maximum relative change over all cells; after `max-iter` passes it warns and writes
+the inputs to a time-stamped `.pt` file, as `TPX->V` does (@sec-ch03-eos).
+
+```{python}
+#| label: fig-ch03-entropy-condensate
+#| fig-cap: "Water with the heat capacities of the Jupiter test card and the `h2o_ideal` curve. (a) Entropy over the gas constant of the vapour at its saturation partial pressure (blue) and of the liquid that the condensate construction derives from it (dashed green). (b) The gap between them times temperature (green) against the enthalpy difference of the two phases (dotted blue with circles): the construction makes the two equal at every temperature."
+#| fig-alt: "Panel (a): two curves of entropy against temperature from 230 to 330 K, the vapour curve above the liquid curve, both decreasing slowly. Panel (b): two coincident curves in kilojoules per mole, decreasing from about 36 to 31 across the same temperature range."
+#| echo: false
+from kintera_report.ch03.figures.fig_entropy_condensate import make_fig
+make_fig()
+```
+
+### Code
+
+| what | code link | symbol | switch |
+|---|---|---|---|
+| gas entropy, @eq-ch03-entropy-gas (species record only) | {{< code src/thermo/eval_uhs.cpp eval_entropy_R overload=1 >}} | `eval_entropy_R` | always |
+| gas and condensate entropy, @eq-ch03-entropy-b, @eq-ch03-entropy-condensate | {{< code src/thermo/eval_uhs.cpp eval_entropy_R overload=2 >}} | `eval_entropy_R` | nucleation reactions |
+| $L_j(T)$ for all reactions | {{< code src/thermo/log_svp.hpp LogSVPFunc::call >}} | `LogSVPFunc::call` | always |
+| per-volume $S$, mass basis (`PVT->S`) | {{< code src/thermo/thermo.hpp ThermoYImpl::_entropy_vol >}} | `ThermoYImpl::_entropy_vol` | always |
+| per-volume $S$, mole basis (`TPV->S`) | {{< code src/thermo/thermo.hpp ThermoXImpl::_entropy_vol >}} | `ThermoXImpl::_entropy_vol` | always |
+| `THS->G`, `TUS->F` | {{< code src/thermo/thermo_x.cpp ThermoXImpl::compute >}} | `ThermoXImpl::compute` | always |
+| `PXS->T`, @eq-ch03-entropy-newton | {{< code src/thermo/thermo_x.cpp ThermoXImpl::_entropy_to_temp >}} | `ThermoXImpl::_entropy_to_temp` | `max-iter`, `ftol` |
+| condensate offsets zeroed | {{< code src/thermo/thermo_y.cpp ThermoYImpl::reset >}} | `ThermoYImpl::reset` | always |
+
+: Code map of the entropy functions. {#tbl-ch03-entropy-code}
+
+Walk-through:
+
+1. Both `_entropy_vol` wrappers call the options overload of `eval_entropy_R`, which first checks that the
+   concentration axis and the stoichiometric matrix have $N$ rows (`The last dimension of conc must match`).
+2. The gas block is filled, then `LogSVPFunc::init` is called with the card's nucleation options (a null set is
+   treated as empty, so a module built without reactions does not crash: `tests/test_thermo_none_nucleation.py`).
+3. `eval_enthalpy_R` of @sec-ch03-caloric gives $\hat h_i$, the matrix product with `stoich` the reaction sums,
+   and the pseudo-inverse of the transposed condensate block the condensate entropies.
+4. `PXS->T` uses `TPX->V`, `TV->cp`, `TPV->S` and `forward` in each pass and warns `max iteration reached`.
+
+In Python, the molar entropy of an equilibrated parcel and the Gibbs energy:
+
+```python
+conc = tx.compute("TPX->V", [temp, pres, xfrac])
+S_vol = tx.compute("TPV->S", [temp, pres, conc])  # J m^-3 K^-1
+s_mol = S_vol / conc.sum(-1)                       # J mol^-1 K^-1, all species
+H_vol = tx.compute("TV->H", [temp, conc])
+G_vol = tx.compute("THS->G", [temp, H_vol, S_vol])
+```
+
+### Tests
+
+| test (ctest name) | what it asserts | tolerance | where the tolerance comes from |
+|---|---|---|---|
+| `tests/test_thermo.cpp` (`test_thermo`), `DeviceTest.thermo_x` | `PXS->T` of `TPV->S` on an equilibrated state returns $T$ | `allclose`, $10^{-4}$ | set in the test; not derived |
+| `tests/test_thermo.cpp` (`test_thermo`), `DeviceTest.thermo_y` | `PVT->S` evaluates without error on CPU and CUDA | none (smoke) | none |
+| `tests/test_thermo_none_nucleation.py` (`test_python_subprocess`) | `TPV->S` with `nucleation(None)` equals the default or raises a Python error, never crashes | rtol $10^{-12}$ | round-off of identical arithmetic |
+| `tests/test_jupiter_tp_adiabat.py` (`test_jupiter_tp_adiabat.py`) | specific entropy from `TPV->S` is conserved along the column the example constructs | $10^{-5}\,\mathrm{J\,kg^{-1}\,K^{-1}}$ | the example's bisection tolerance |
+| `src/kintera_report/ch03/checks/entropy_check.py` | partial-pressure form; $b_j$ from $\Delta G = 0$; `pinv` exactness; enthalpy branches | symbolic; $10^{-14}$ | algebra |
+
+: Tests of the entropy functions. {#tbl-ch03-entropy-tests}
+
+The `DeviceTest` cases passed on CPU and CUDA, float and double, in the recorded CUDA-build run;[^ch03-entropy-run]
+`test_jupiter_tp_adiabat.py` passed in the recorded CPU run.[^ch03-entropy-adiabat] No test compares the condensate
+entropy with an independent value; the check verifies the construction symbolically (`[C2]`) and prints the water
+value, $\hat s_{\mathrm c}(280\,\mathrm K) = -9.34$ against $\hat s_v = 4.37$ for the saturated vapour, with
+$T(s_v - s_c) = h_v - h_c = 31.9\,\mathrm{kJ\,mol^{-1}}$ (`[C5]`).
+
+[^ch03-entropy-run]: [sha: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45; deck: `tests/jupiter.yaml`; run:
+    `ctest -R 'test_thermo|test_equilibrate_tp_max_iter' -V` in the `tests/` directory of a CUDA build
+    (`cmake -DCUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120`), CPU and CUDA (one RTX 5090), float and double; `test_thermo`
+    66 passed, 8 skipped; gcc 11.5.0, CUDA 12.9, cmake 3.31.8, libtorch of torch 2.10.0+cu128]
+
+[^ch03-entropy-adiabat]: [sha: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45; deck:
+    `examples/jupiter_kcl_mgsio3.yaml`; run: `PYTHONPATH=<install-dir> pytest tests/test_jupiter_tp_adiabat.py`, CPU,
+    double; 2 passed; Python 3.11.13, torch 2.10.0+cu128, numpy 2.4.6]
+
+### Limits
+
+::: {.callout-warning title="Limits"}
+- The entropy stays on the constant-heat-capacity baseline when `use-nasa9-cp` or `use-h2-cp` changes the
+  energy (@sec-ch03-caloric), so $\partial S/\partial T \ne C_p/T$ in those runs and `PXS->T` converges to a temperature
+  that is not the isentropic one. Not measured.
+- A condensate in several reactions gets the minimum-norm split of the pseudo-inverse; no test covers that case.
+- The $10^{-300}$ clamp on the gas-only mole fraction makes the entropy of an absent gas finite but
+  $\sim 690\,\mathcal R$; weighted by its zero concentration it does not affect $S$, but a host that reads per-species
+  entropies sees it.
+- `PXS->T` restarts every cell from `Tref` and runs a full saturation adjustment per pass; it is the most
+  expensive key of the module, and its cost is not measured here.
+:::

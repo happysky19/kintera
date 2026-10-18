@@ -1,0 +1,5 @@
+[C1] PASS NH4SH: c-form minus p-form of Q/Q_sat simplifies to 0
+[C2] PASS exponents: legacy [1.0, 1.0, 0.0, 0.0] (H2 ignored), with ngas [1.0, 1.0, -1.0, 0.0] (H2 divides)
+[C3] PASS H2O at 1 mol m^-3, 300 K: p_sat = 3539.5 Pa, saturation ratio = 0.70472
+[C4] PASS zero reactant -> 0.0, zero gas product -> inf, both -> nan
+relative_humidity_check: 4 of 4 passed

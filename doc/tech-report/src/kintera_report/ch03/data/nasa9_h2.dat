@@ -1,0 +1,9 @@
+# NASA-9 polynomial coefficients of H2, copied verbatim from data/nasa9.dat of chengcli/kintera at the code pin
+# (code_pin.yml; blob 5bb92773c1af997e5c1722faf491ec8f6881b001). Two ranges, 200-1000 K (low) and 1000-6000 K (high);
+# 10 coefficients per range: a0-a6, a7 (= 0), a8, a9. Read by kintera_report.ch03.figures.fig_caloric_h2cp
+# and kintera_report/ch03/checks/caloric_check.py.
+H2
+ 4.078323210E+04  -8.009186040E+02   8.214702010E+00  -1.269714457E-02   1.753605076E-05
+-1.202860270E-08   3.368093490E-12   0.000000000E+00   2.682484665E+03  -3.043788844E+01
+ 5.608128010E+05  -8.371504740E+02   2.975364532E+00   1.252249124E-03  -3.740716190E-07
+ 5.936625200E-11  -3.606994100E-15   0.000000000E+00   5.339824410E+03  -2.202774769E+00
