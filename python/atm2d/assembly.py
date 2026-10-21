@@ -113,6 +113,28 @@ def build_implicit_operator(
     return _apply_boundary_conditions(state, matrix, boundary_conditions)
 
 
+def _backward_euler_matrix(
+    operator: SparseSystemMatrix, scale: float, identity_coeff: float,
+) -> SparseSystemMatrix:
+    """Require the time-derivative coefficient to survive diagonal addition.
+
+    This is an exact representability check, not a conditioning or singularity
+    test. Dropping the identity can turn a closed transport system into its
+    singular steady-state operator, for which a sparse solve may return a
+    finite, incorrect result without raising.
+    """
+    coo = operator.global_csr.to_sparse_coo().coalesce()
+    rows, cols = coo.indices()
+    diagonal = coo.values()[rows == cols] * scale
+    shift = torch.as_tensor(identity_coeff, dtype=operator.dtype, device=operator.device)
+    if bool((shift == 0) | ((diagonal + shift) == diagonal).any()):
+        raise RuntimeError(
+            "backward-Euler identity shift is lost in the working precision; "
+            "reduce the timestep or use higher precision"
+        )
+    return operator.affine_with_identity(scale, identity_coeff)
+
+
 def build_implicit_step_system(
     state: AtmState2D,
     kzz: torch.Tensor,
@@ -141,6 +163,11 @@ def build_implicit_step_system(
     backward-Euler starting point — this is the original single-shot frozen
     linearization. Pass ``c0`` explicitly to keep the BE starting point fixed
     across Newton iterations that re-linearize at successive ``c_k``.
+
+    Raises ``RuntimeError`` if any diagonal loses the identity shift entirely
+    in the working precision, before solving or applying caller postprocessing.
+    This conservative representability requirement does not guarantee that a
+    surviving shift gives a well-conditioned system.
     """
 
     source_linearization = None
@@ -189,7 +216,7 @@ def build_implicit_step_system(
     _RESCALE_THRESHOLD = 1.0
     if float(dt) >= _RESCALE_THRESHOLD:
         dt_inv = 1.0 / float(dt)
-        system = operator.affine_with_identity(-1.0, dt_inv)
+        system = _backward_euler_matrix(operator, -1.0, dt_inv)
         rhs_c = state.concentration if c0 is None else c0
         rhs = dt_inv * rhs_c
         if source_linearization is not None:
@@ -204,7 +231,7 @@ def build_implicit_step_system(
                 )
             rhs = rhs + (source_linearization.tendency - jacobian_state)
     else:
-        system = operator.affine_with_identity(-float(dt), 1.0)
+        system = _backward_euler_matrix(operator, -float(dt), 1.0)
         rhs = state.concentration if c0 is None else c0
         if source_linearization is not None:
             jacobian_state = torch.einsum(
