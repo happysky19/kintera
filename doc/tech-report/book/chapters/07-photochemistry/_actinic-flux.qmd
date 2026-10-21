@@ -146,9 +146,9 @@ failure that documents S7-3 (row K17); the in-tree test `test_actinic_flux_from_
 this reversed profile (more flux in layer 0, at $10^5$ Pa, than in the top layer). `[i3]` is step 5: the optical depth
 is half the total, because the KINETICS7 reader leaves only the non-dissociating $5 \times 10^{-19}\ \mathrm{cm^2}$ in
 column 0. It is an expected failure that documents S7-4 (row K18); its tolerance allows for the KINETICS7 reader,
-which parses values in single precision. With the K17 fix applied, `[i0]` gives $[0.0273, 0.0273, 0.0273, 0.5137]$ and
-`[i2]` passes; with the K18 fix, `[i3]` gives $4.6 \times 10^{-8}$ and passes; `[i1]` is $2.2 \times 10^{-16}$ in all
-three builds.[^ch07-check-fixes] CUDA: not run (no GPU on the machine that ran the check); unverified.
+which parses values in single precision. With both K17 and K18 fixes applied, `[i0]` gives
+$[0.0273, 0.0273, 0.0273, 0.5137]$ and `[i2]` passes; `[i3]` gives $4.6 \times 10^{-8}$ and passes;
+`[i1]` is $2.2 \times 10^{-16}$ in both builds.[^ch07-check-fixes] CUDA: not run; unverified.
 <!-- equation-check: eq-ch07-actinic-flux-beam check_ch07_photolysis.py [i2] -->
 <!-- equation-check: eq-ch07-actinic-flux-tau check_ch07_photolysis.py [i3] -->
 
@@ -250,10 +250,12 @@ absorption (`[i3]`, S7-4, row K18). All of this was run on CPU only; CUDA is unv
     `derivation-checks/check_ch07_photolysis.out` lines `[i1]`, `[i0]`, `[i2]`, `[i3]`; `[i2]` and `[i3]` are
     EXPECTED-FAIL by design (S7-3, #54 row K17; S7-4, #54 row K18).]
 
-[^ch07-check-fixes]: [source: the same script, unchanged, run on CPU in double precision against two further CPU
-    builds of UCzhangxi/kintera: the K17 fix (#95, merged as 9c89752b on `fix/thermo-20261019`) and the tip of
-    `fix/thermo-20261019` with the K18 fix #94 merged. K17 build: 14 PASS, 0 FAIL, 3 EXPECTED-FAIL (`[g]`, `[h]`, `[i3]`),
-    4 INFO. K18 build: 14 PASS, 0 FAIL, 3 EXPECTED-FAIL (`[g]`, `[h]`, `[i2]`), 4 INFO. Python 3.13.15, torch 2.10.0.]
+[^ch07-check-fixes]: [source: the same script, unchanged, run on CPU in double precision against UCzhangxi/kintera
+    at `9c89752b`, containing both K17 and K18 fixes (#95 and #94):
+    15 PASS, 0 FAIL, 2 EXPECTED-FAIL (`[g]`, `[h]`), 4 INFO. `[i2]` passes with relative error 0;
+    `[i3]` passes with relative error `4.581e-08` (both tolerances `1e-6`). Run:
+    `KINTERA_WT=<build> python doc/tech-report/derivation-checks/check_ch07_photolysis.py` from a scratch directory;
+    Python 3.11.13, torch 2.10.0+cu128, kintera 2.6.5.]
 
 [^ch07-contract-src]: [source: the deck of @sec-ch07-rate with a temperature of shape (2, 3); a flux of shape (3) and
     (3, 2, 3) gives $J$ of shape (2, 3, 2); a flux batch of 5 raises a size-mismatch error; a flux of length 4
