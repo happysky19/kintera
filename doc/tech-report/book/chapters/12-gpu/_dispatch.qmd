@@ -370,7 +370,9 @@ seed 20261020, 64 cells per deck and precision, $\Delta t = 10$ s, temperature 8
 `Kinetics.forward_with_rate_constants`, `Kinetics.jacobian` and `evolve_implicit` on each device, the largest
 difference over the largest CPU value; committed values in
 `derivation-checks/ch12/saved-preparation/kinetics64.jsonl` and `kinetics32.jsonl`, which the `conditioning` mode
-reads directly (`check_ch12_spec_complement.py:131-134`); one CUDA build on one host.]
+reads directly (`check_ch12_spec_complement.py:131-134`); produced by `src/kintera_report/ch12/runs/kinetics_campaign.py`,
+which builds the same inputs as that `conditioning` mode and compares each quantity on both devices
+(`--check` compares against the saved records instead of writing); one CUDA build on one host.]
 
 ### Limits
 
@@ -425,7 +427,7 @@ two-species gas `A <=> B`; run: `python -P src/kintera_report/ch12/runs/batch_pr
 kintera checkout at the pin, CPU, double; torch 2.10.0+cu126, Python 3.11.13.]
 
 [^ch12-dispatch-missing]: [sha: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45; deck: the YAML input of
-`tests/test_coagulation_pressure_switch.py`; run: `python -P ei_case.py cuda ok` against a `-DCUDA=OFF` build, which
+`tests/test_coagulation_pressure_switch.py`; run: `python -P src/kintera_report/ch12/runs/ei_case.py cuda ok` against a `-DCUDA=OFF` build, which
 calls `evolve_implicit` on CUDA tensors;
 torch 2.10.0+cu126, Python 3.11.13.]
 
@@ -461,7 +463,8 @@ isolated cell is cell 1, at $T = 250.75376892089844$ K and $10^5$ Pa, `float32`,
 $\texttt{atol} = 10^{-6}$, $\texttt{rtol} = 10^{-4}$; at `1.e-12` the diagnostics are 11 (CPU) and $-2050$ (CUDA),
 fractions differ by at most $3.73\times10^{-9}$ with 0 entries outside tolerance and the gain by up to 5110 with 15
 of 64 outside; at `1.e-5` both diagnostics are 11 and the fractions differ by at most $1.86\times10^{-9}$; one pair
-of builds, one state, not a sweep over states or devices; a measurement outside the suite, not a committed check.]
+of builds, one state, not a sweep over states or devices; a measurement outside the suite, not a committed check,
+driven by `src/kintera_report/ch12/runs/ftol_sweep.py --ftol 1e-12` and `--ftol 1e-5`.]
 
 [^ch12-dispatch-absent]: [sha: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45; decks: `tests/jupiter.yaml`,
 `tests/earth.yaml` and `examples/jupiter_kcl_mgsio3.yaml` over 110 to 1600 K and $10^2$ to $10^7$ Pa, five vapour
@@ -470,12 +473,11 @@ amounts and every one- and two-vapour-zeroed variant, 12750 cells; run: `ThermoX
 solve with a finite-difference $\mathrm d\xi_r/\mathrm dT$; 14790 absent-gas reaction instances, 14688 at a
 converged exit, none with a live condensate or a non-zero gain row; `tests/jup-thermo.yaml` could not be loaded
 through `ThermoX`; CPU and double precision only, no CUDA leg; a measurement outside the suite, not a committed
-check.]
+check, driven by `src/kintera_report/ch12/runs/absent_gas_sweep.py`.]
 
 [^ch12-dispatch-stoich]: [sha: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45; deck: the YAML input of
-`tests/test_coagulation_pressure_switch.py`, 64 cells; run: `python -P ei_case.py cuda cpu`, `python -P ei_case.py
-cuda float32`
-and `python -P ei_case.py cuda narrow`, each in its own process; the script calls `evolve_implicit` with rates and
+`tests/test_coagulation_pressure_switch.py`, 64 cells; run: `python -P src/kintera_report/ch12/runs/ei_case.py cuda cpu`,
+`python -P src/kintera_report/ch12/runs/ei_case.py cuda float32` and `python -P src/kintera_report/ch12/runs/ei_case.py cuda narrow`, each in its own process; the script calls `evolve_implicit` with rates and
 Jacobian on CUDA and `stoich` on the CPU, as single precision, or with one reaction column of two; CUDA 12.6.85, torch
 2.10.0+cu126, Python 3.11.13.]
 

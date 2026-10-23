@@ -147,7 +147,8 @@ from the source tree, CUDA build with one compute capability 6.1 GPU (2 passed) 
 [^ch12-devfn-scratch]: [sha: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45 with `src/func_table.cpp` patched in a
 scratch copy only, not committed; deck: names `h2o_ideal`, `h2o_ideal_ddT`, `nh3_ideal`, `na_h2s_visscher_ddT` and
 the test function; run: `cmake --build . --target kintera_release` in the `build` directory of a `-DCUDA=ON` Release
-build, so that only the CPU library and its tables change, then `python -P probe.py <names>`, a scratch script that
+build, so that only the CPU library and its tables change, then `python -P src/kintera_report/ch12/runs/probe.py <names>`; the patch and the
+rebuild/probe/restore sequence are committed as `src/kintera_report/ch12/runs/func_table_gap.py`, which
 evaluates $\ln K$ at 250 K and 300 K through `relative_humidity` on CPU and CUDA tensors; source restored and the
 library rebuilt bit-identical afterwards; GeForce GTX 1080 Ti, CUDA 12.6.85, GCC 11.5.0, torch 2.10.0+cu126,
 Python 3.11.13.]
