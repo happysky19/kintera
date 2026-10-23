@@ -95,7 +95,7 @@ def main() -> int:
     original = src.read_text()
     backup = src.with_suffix(".cpp.func_table_gap.bak")
     here = pathlib.Path(__file__).resolve().parent
-    probe = here / "probe.py"
+    probe = here / "func_table_probe.py"
 
     shutil.copy2(src, backup)
     try:

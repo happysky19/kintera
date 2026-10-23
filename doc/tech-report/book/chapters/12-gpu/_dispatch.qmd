@@ -370,9 +370,12 @@ seed 20261020, 64 cells per deck and precision, $\Delta t = 10$ s, temperature 8
 `Kinetics.forward_with_rate_constants`, `Kinetics.jacobian` and `evolve_implicit` on each device, the largest
 difference over the largest CPU value; committed values in
 `derivation-checks/ch12/saved-preparation/kinetics64.jsonl` and `kinetics32.jsonl`, which the `conditioning` mode
-reads directly (`check_ch12_spec_complement.py:131-134`); produced by `src/kintera_report/ch12/runs/kinetics_campaign.py`,
-which builds the same inputs as that `conditioning` mode and compares each quantity on both devices
-(`--check` compares against the saved records instead of writing); one CUDA build on one host.]
+reads directly (`check_ch12_spec_complement.py:131-134`); produced by the recovered
+`src/kintera_report/ch12/runs/probe.py kinetics --dtype float64` and `--dtype float32`, restored from the report's own history at
+`516917515670447774cada7d52ba5cb705df4987` (removed by `cfad2f6d36b1649b4253f48ca1aa780747ba2180`). Rerunning it at
+the pin on an RTX 5090 reproduces both committed JSONL files **byte for byte**. One CUDA build on one host; the
+comparison tolerances are the producer's diagnostic `(atol, rtol)` of $(10^{-12}, 10^{-10})$ for double and
+$(10^{-6}, 10^{-4})$ for single, not a machine-independent bound.]
 
 ### Limits
 
@@ -411,9 +414,12 @@ which builds the same inputs as that `conditioning` mode and compares each quant
   ends the process with the same illegal memory access (@tbl-ch12-dispatch-contract).
 - **The absent-gas exit path has been surveyed on the CPU only.** `call_equilibrate_tp_cuda` runs the same per-cell
   `equilibrate_tp` as the CPU driver, including the exit pass whose activity test and weights differ from those of
-  the iteration when a reaction's gas is exactly zero (@sec-ch04-equilibrate-tp, Limits). A survey of the in-tree
-  nucleation decks found 14688 converged states with an absent gas and no disagreement between the returned gain and
-  a finite-difference $\mathrm d\xi_r/\mathrm dT$ there, but that survey was **CPU and double precision throughout**;
+  the iteration when a reaction's gas is exactly zero (@sec-ch04-equilibrate-tp, Limits). A structural survey of the in-tree
+  nucleation decks found 14688 **absent-gas reaction instances** at a converged exit (of 14790 instances in all),
+  none with a live condensate or a non-zero gain row. These are reaction instances, not distinct states, and the
+  survey checked structure only: it did not compare the returned gain with a finite-difference
+  $\mathrm d\xi_r/\mathrm dT$ on every instance. A separate run covers **selected** derivative controls. The survey
+  was **CPU and double precision throughout**;
   it is a sampled result on a grid, not a proof, and the CUDA leg of it has not been run.[^ch12-dispatch-absent] It
   is therefore not evidence that the two devices agree on those states.
 
@@ -463,15 +469,21 @@ isolated cell is cell 1, at $T = 250.75376892089844$ K and $10^5$ Pa, `float32`,
 $\texttt{atol} = 10^{-6}$, $\texttt{rtol} = 10^{-4}$; at `1.e-12` the diagnostics are 11 (CPU) and $-2050$ (CUDA),
 fractions differ by at most $3.73\times10^{-9}$ with 0 entries outside tolerance and the gain by up to 5110 with 15
 of 64 outside; at `1.e-5` both diagnostics are 11 and the fractions differ by at most $1.86\times10^{-9}$; one pair
-of builds, one state, not a sweep over states or devices; a measurement outside the suite, not a committed check,
-driven by `src/kintera_report/ch12/runs/ftol_sweep.py --ftol 1e-12` and `--ftol 1e-5`.]
+of builds and one isolated cell. The 200-cell sweep reported above is a **separate** experiment with its own
+driver, so "not a sweep over states" describes this cell only and not the evidence as a whole. A measurement outside
+the suite, not a committed check. Driven by the recovered `src/kintera_report/ch12/runs/one_cell.py`, restored from the report's own history at
+`516917515670447774cada7d52ba5cb705df4987`; its output reproduces this footnote's diagnostics (11 and -2050), the
+$3.73\times10^{-9}$ fraction difference and the 15-of-64 gain entries identically on an RTX 5090, the same device
+class recorded in the preparation's `identity.json`.]
 
 [^ch12-dispatch-absent]: [sha: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45; decks: `tests/jupiter.yaml`,
 `tests/earth.yaml` and `examples/jupiter_kcl_mgsio3.yaml` over 110 to 1600 K and $10^2$ to $10^7$ Pa, five vapour
 amounts and every one- and two-vapour-zeroed variant, 12750 cells; run: `ThermoX.forward` with `max-iter` 400 and
-`ftol` $10^{-13}$, CPU, double, comparing the returned gain converted through `effective_cp`'s own least-squares
-solve with a finite-difference $\mathrm d\xi_r/\mathrm dT$; 14790 absent-gas reaction instances, 14688 at a
-converged exit, none with a live condensate or a non-zero gain row; `tests/jup-thermo.yaml` could not be loaded
+`ftol` $10^{-13}$, CPU, double; 14790 absent-gas **reaction instances**, 14688 at a converged exit, none with a
+live condensate or a non-zero gain row. The survey is structural: it records absent gases, condensate presence and
+zero gain rows and columns, and does **not** compare the returned gain with a finite-difference
+$\mathrm d\xi_r/\mathrm dT$ on every instance; derivative agreement was checked on selected controls only, by a
+separate driver; `tests/jup-thermo.yaml` could not be loaded
 through `ThermoX`; CPU and double precision only, no CUDA leg; a measurement outside the suite, not a committed
 check, driven by `src/kintera_report/ch12/runs/absent_gas_sweep.py`.]
 

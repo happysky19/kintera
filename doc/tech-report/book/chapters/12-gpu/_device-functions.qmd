@@ -147,11 +147,19 @@ from the source tree, CUDA build with one compute capability 6.1 GPU (2 passed) 
 [^ch12-devfn-scratch]: [sha: kintera@0d9f67f97d841147e23283d2dcdab302238d2c45 with `src/func_table.cpp` patched in a
 scratch copy only, not committed; deck: names `h2o_ideal`, `h2o_ideal_ddT`, `nh3_ideal`, `na_h2s_visscher_ddT` and
 the test function; run: `cmake --build . --target kintera_release` in the `build` directory of a `-DCUDA=ON` Release
-build, so that only the CPU library and its tables change, then `python -P src/kintera_report/ch12/runs/probe.py <names>`; the patch and the
-rebuild/probe/restore sequence are committed as `src/kintera_report/ch12/runs/func_table_gap.py`, which
+build, so that only the CPU library and its tables change, then `python -P src/kintera_report/ch12/runs/func_table_probe.py <names>`; the patch and the
+rebuild/probe/restore sequence are committed as `src/kintera_report/ch12/runs/func_table_gap.py`. The probe
 evaluates $\ln K$ at 250 K and 300 K through `relative_humidity` on CPU and CUDA tensors; source restored and the
-library rebuilt bit-identical afterwards; GeForce GTX 1080 Ti, CUDA 12.6.85, GCC 11.5.0, torch 2.10.0+cu126,
-Python 3.11.13.]
+library rebuilt afterwards (see the reproduction note below on that bit-identity claim); GeForce GTX 1080 Ti, CUDA 12.6.85, GCC 11.5.0, torch 2.10.0+cu126,
+Python 3.11.13.
+**Reproduced 2026-10-23** in a disposable checkout at the same source pin, with the front insertion: on
+CUDA `h2o_ideal` returned 4.559047 against 4.333445 on the CPU at 250 K, `nh3_ideal` returned
+`nh3_h2s_lewis`'s values, and no error was raised -- the two-slot shift and the quoted 4.559/4.333 both
+hold. RTX 5090, CUDA 12.9, torch 2.10.0+cu128, so the effect is not specific to the original GPU.
+**The bit-identical restoration is not confirmed**: the restore here was rebuilt in a different build
+directory, whose absolute paths are compiled in, so its digest differs from the baseline for a reason
+unrelated to the source. Behaviour after restore is correct (largest CPU/CUDA difference 8.9e-16).
+Reading past the end of a device array is undefined, so neither the 0 nor the "no error" is portable.]
 
 <!-- equation-check: eq-ch12-device-functions-index check_ch12_twins.py (a) -->
 
