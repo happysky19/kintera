@@ -50,7 +50,12 @@ def run(torch, kintera, device, ftol, dtype):
     op = kintera.ThermoOptions.from_yaml(_deck())
     op.max_iter(MAX_ITER)
     op.ftol(ftol)
-    th = kintera.ThermoX(op).to(device)
+    # .to() is in-place here and returns None, so it is called for its effect, not rebound;
+    # and it resolves a str to a dtype, so the device has to arrive as a torch.device.
+    dev = torch.device(device)
+    th = kintera.ThermoX(op)
+    th.to(dtype)   # the deck's default precision is not the one under test
+    th.to(dev)
     nsp = len(op.species())
     T = torch.linspace(T_LO, T_HI, CELLS, dtype=dtype)
     T[CELL] = T_CELL
@@ -59,7 +64,7 @@ def run(torch, kintera, device, ftol, dtype):
     for vid in op.vapor_ids():
         X[:, vid] = 1e-3
     X[:, 0] = 1.0 - X.sum(dim=1)
-    out = th.forward(T.to(device), P.to(device), X.to(device))
+    out = th.forward(T.to(dev), P.to(dev), X.to(dev))
     gain = th.buffer("gain").cpu() if "gain" in dir(th) else None
     diag = th.buffer("diagnostics").cpu() if "diagnostics" in dir(th) else None
     return out.cpu(), gain, diag

@@ -74,8 +74,11 @@ def build_inputs(torch, kt, name, dtype, root, saved):
 def quantities(torch, kt, op, T, P, C, dtype, device):
     kin = kt.Kinetics(op)
     kin.to(dtype)
-    kin = kin.to(device)
-    t, p, c = T.to(device), P.to(device), C.to(device)
+    # .to() is in-place here and returns None, so it is called for its effect, not rebound;
+    # and it resolves a str to a dtype, so the device has to arrive as a torch.device.
+    dev = torch.device(device)
+    kin.to(dev)
+    t, p, c = T.to(dev), P.to(dev), C.to(dev)
     if not hasattr(kin, "forward_with_rate_constants"):
         raise RuntimeError("this kintera has no Kinetics.forward_with_rate_constants; "
                            "the chapter pins kintera@0d9f67f9 (v2.6.5), where it exists")
