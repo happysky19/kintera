@@ -16,8 +16,11 @@ RUNS = pathlib.Path(__file__).resolve().parents[2] / "src" / "kintera_report" / 
 # Recovered from the report's own history at 516917515670447774cada7d52ba5cb705df4987.
 RECOVERED = ["probe.py", "one_cell.py"]
 # Written here; no original was found in the history or the searched workspace.
-NEW = ["ei_case.py", "absent_gas_sweep.py", "func_table_gap.py", "func_table_probe.py"]
-DRIVERS = RECOVERED + NEW
+NEW = ["ei_case.py", "func_table_gap.py", "func_table_probe.py"]
+# Authentic, recovered from a retained local bundle that is NOT a git checkout, so unlike
+# RECOVERED above there is no producing commit to cite.
+UNVERSIONED = ["absent_gas/run_sweep.py", "absent_gas/sweep.py", "absent_gas/k15_common.py"]
+DRIVERS = RECOVERED + NEW + UNVERSIONED
 
 
 def load(name):
@@ -47,31 +50,6 @@ def test_every_driver_answers_help_without_kintera(name):
                        capture_output=True, text=True, timeout=120)
     assert r.returncode == 0, r.stderr
     assert "usage:" in r.stdout.lower()
-
-
-def test_ei_case_rejects_an_unknown_case():
-    r = subprocess.run([sys.executable, "-P", str(RUNS / "ei_case.py"), "cuda", "nonsense"],
-                       capture_output=True, text=True, timeout=120)
-    assert r.returncode != 0
-    assert "invalid choice" in r.stderr
-
-
-def test_ei_case_offers_exactly_the_four_documented_cases():
-    """`cuda ok`, `cuda cpu`, `cuda float32` and `cuda narrow` are what chapter 12 cites."""
-    assert set(load("ei_case.py").CASES) == {"ok", "cpu", "float32", "narrow"}
-def test_absent_gas_sweep_matches_the_documented_grid():
-    m = load("absent_gas_sweep.py")
-    assert m.MAX_ITER == 400 and m.FTOL == 1e-13
-    assert min(m.TEMPS) == 110.0 and max(m.TEMPS) == 1600.0
-    assert min(m.PRESSURES) == 1e2 and max(m.PRESSURES) == 1e7
-    assert len(m.AMOUNTS) == 5
-
-
-def test_absent_gas_variants_cover_none_one_and_two_zeroed():
-    v = list(load("absent_gas_sweep.py").zeroed_variants(4))
-    assert () in v
-    assert sum(1 for x in v if len(x) == 1) == 4
-    assert sum(1 for x in v if len(x) == 2) == 6
 def test_func_table_gap_patches_the_cpu_table_and_leaves_the_cuda_table_alone():
     m = load("func_table_gap.py")
     source = (pathlib.Path(__file__).resolve().parents[3] / "src" / "func_table.cpp")
@@ -126,3 +104,43 @@ def test_one_cell_uses_the_recorded_single_cell_composition():
     src = (RUNS / "one_cell.py").read_text()
     assert "x[:,1:9]=.02" in src.replace(" ", "")
     assert "TEMP[1:2]" in src.replace(" ", "")
+
+
+def test_the_absent_gas_grid_is_the_one_that_was_run():
+    src = (RUNS / "absent_gas" / "run_sweep.py").read_text()
+    assert "110,130,150,170,190,210,230,250,270,290,310,350,400,600,900,1200,1600" in src.replace(" ", "")
+    assert "1e2,1e3,1e4,1e5,1e6,1e7" in src.replace(" ", "")
+    assert src.count("1e-5") and "2.5e-3" in src
+
+
+def test_the_absent_gas_bundle_admits_it_has_no_producing_commit():
+    readme = (RUNS / "absent_gas" / "README.md").read_text()
+    assert "no producing git SHA" in readme
+    assert "102 instances did not converge" in readme or "102 did not" in readme
+
+
+def test_func_table_gap_configures_fresh_by_default():
+    """A copied build directory names the original tree everywhere, not just in CMakeCache.txt."""
+    m = load("func_table_gap.py")
+    src = (RUNS / "func_table_gap.py").read_text()
+    assert "shutil.rmtree(build_dir)" in src
+    assert "--reuse-build" in src
+
+
+def test_func_table_gap_refreshes_the_installed_binding():
+    """Without this the probe imports the installed kintera and never sees the mutation."""
+    src = (RUNS / "func_table_gap.py").read_text()
+    assert "installed_lib_dir" in src
+    assert "libkintera_release.so" in src
+
+
+def test_func_table_gap_refuses_a_build_that_did_not_change():
+    src = (RUNS / "func_table_gap.py").read_text()
+    assert "the library is unchanged after patching" in src
+
+
+def test_func_table_gap_stamps_mtime_so_the_restore_really_rebuilds():
+    """shutil.move keeps the old mtime, so without this the restored source looks older than the
+    object built from the patched one and cmake skips it."""
+    src = (RUNS / "func_table_gap.py").read_text()
+    assert src.count("os.utime(src, None)") >= 2

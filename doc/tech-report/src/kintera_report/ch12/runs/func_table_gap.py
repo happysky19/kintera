@@ -71,9 +71,56 @@ def sha(path: pathlib.Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
 
 
+def cache_value(build_dir: pathlib.Path, key: str) -> str | None:
+    cache = build_dir / "CMakeCache.txt"
+    if not cache.exists():
+        return None
+    for line in cache.read_text(errors="replace").splitlines():
+        if line.startswith(key + ":"):
+            return line.split("=", 1)[1].strip()
+    return None
+
+
+def fresh_configure(build_dir: pathlib.Path, source: pathlib.Path, reuse: bool) -> None:
+    """Configure this build directory from scratch, for this source tree.
+
+    A disposable checkout is normally made with `cp -a`, which brings the build directory along.
+    Everything in it -- the cache, the generated makefiles, and a CMakeCache inside every
+    FetchContent `_deps/*-subbuild` -- still names the ORIGINAL tree. `cmake --build` then prints
+    "Build files have been written to: <original>/build-cuda", rebuilds nothing here, and exits 0,
+    so the whole cycle reports success while the library is never rebuilt. Repairing that
+    piecemeal is not worth it: the only state that is certainly ours is state we generated, so by
+    default the directory is removed and configured again. `--reuse-build` skips this for a build
+    directory you know was made here.
+    """
+    if reuse:
+        print("  --reuse-build: configuring skipped; the build directory must already be this tree's")
+        return
+    if build_dir.exists():
+        shutil.rmtree(build_dir)
+    args = ["cmake", "-S", str(source.resolve()), "-B", str(build_dir.resolve()),
+            "-DCMAKE_BUILD_TYPE=Release", "-DCUDA=ON", "-DNETCDF=ON"]
+    for env, flag in (("CMAKE_CUDA_ARCHITECTURES", "-DCMAKE_CUDA_ARCHITECTURES="),
+                      ("FUNC_TABLE_GAP_PYTHON", "-DPython3_EXECUTABLE=")):
+        if os.environ.get(env):
+            args.append(flag + os.environ[env])
+    print(f"  configuring {build_dir} from {source}")
+    subprocess.run(args, check=True, stdout=subprocess.DEVNULL)
+
+
 def build(build_dir: pathlib.Path) -> None:
     subprocess.run(["cmake", "--build", str(build_dir), "--target", "kintera_release"],
                    check=True, stdout=subprocess.DEVNULL)
+
+
+def installed_lib_dir() -> pathlib.Path | None:
+    """where the importable kintera keeps its shared libraries, if there is one"""
+    try:
+        import kintera
+    except Exception:
+        return None
+    d = pathlib.Path(kintera.__file__).resolve().parent / "lib"
+    return d if d.is_dir() else None
 
 
 def main() -> int:
@@ -82,6 +129,8 @@ def main() -> int:
     ap.add_argument("--where", choices=["end", "front"], required=True)
     ap.add_argument("--names", default="h2o_ideal h2o_ideal_ddT nh3_ideal na_h2s_visscher_ddT")
     ap.add_argument("--dry-run", action="store_true", help="write the patched source and stop")
+    ap.add_argument("--reuse-build", action="store_true",
+                    help="do not wipe and reconfigure; only for a build directory made here")
     args = ap.parse_args()
 
     repo = pathlib.Path(os.environ.get("KINTERA_REPO", ""))
@@ -89,35 +138,67 @@ def main() -> int:
         sys.exit("func_table_gap.py: set KINTERA_REPO to a kintera checkout")
     src = repo / "src" / "func_table.cpp"
     build_dir = pathlib.Path(args.build)
-    if not args.dry_run and not (build_dir / "CMakeCache.txt").exists():
-        sys.exit(f"func_table_gap.py: {build_dir} is not a cmake build directory")
 
     original = src.read_text()
     backup = src.with_suffix(".cpp.func_table_gap.bak")
     here = pathlib.Path(__file__).resolve().parent
     probe = here / "func_table_probe.py"
+    site = installed_lib_dir()
+    lib = build_dir / "lib" / "libkintera_release.so"
+    saved_install = None
+    baseline = None
 
     shutil.copy2(src, backup)
     try:
+        if not args.dry_run:
+            fresh_configure(build_dir, repo, args.reuse_build)
+            build(build_dir)                      # baseline in THIS directory, for a fair digest
+            baseline = sha(lib)
+            print(f"baseline library in this build directory: {baseline}")
+            if site is not None:
+                saved_install = site / "libkintera_release.so.func_table_gap.bak"
+                shutil.copy2(site / "libkintera_release.so", saved_install)
+
         src.write_text(patched_source(original, args.where))
+        os.utime(src, None)
         print(f"patched {src} ({args.where}); CUDA table in src/func_table.cu untouched")
         if args.dry_run:
             return 0
-        lib = next(build_dir.glob("lib/libkintera_release.so"), None)
-        before = sha(lib) if lib else None
+
         build(build_dir)
-        print("rebuilt kintera_release (CPU library and its tables only)")
+        mutated = sha(lib)
+        print(f"rebuilt kintera_release (CPU library and its tables only): {mutated}")
+        if mutated == baseline:
+            # Rebuilding to the same bytes means the patch never reached the compiler. Reporting
+            # "no difference" from that run would be a false negative, so stop instead.
+            sys.exit("func_table_gap.py: the library is unchanged after patching, so nothing was "
+                     "rebuilt. Refusing to report a result from a build that did not happen.")
+        if site is not None:
+            # Without this the probe imports the INSTALLED kintera and reads the old library, so the
+            # mutation is invisible and the experiment silently reports agreement.
+            shutil.copy2(lib, site / "libkintera_release.so")
+            print(f"  refreshed the installed binding at {site}")
+        else:
+            print("  WARNING: no importable kintera found; the probe will not see the mutation")
         rc = subprocess.run([sys.executable, "-P", str(probe), *args.names.split()]).returncode
         print(f"probe exit {rc}")
     finally:
         shutil.move(str(backup), str(src))
-        if not args.dry_run:
+        # The backup keeps the original mtime, so the restored file looks OLDER than the object
+        # built from the patched one and cmake skips it: the "restored" library is still the
+        # mutated one, and the digest comparison below silently compares it with itself. Stamping
+        # the file now is what makes the restore real.
+        os.utime(src, None)
+        if not args.dry_run and baseline is not None:
             build(build_dir)
-            lib = next(build_dir.glob("lib/libkintera_release.so"), None)
-            after = sha(lib) if lib else None
-            same = (before is not None and before == after)
-            print(f"restored {src} and rebuilt; library digest {before} -> {after}"
-                  f" ({'bit-identical' if same else 'DIFFERS -- investigate before trusting the run'})")
+            restored = sha(lib)
+            same = restored == baseline
+            print(f"restored {src} and rebuilt in the SAME build directory; "
+                  f"{baseline} -> {restored} "
+                  f"({'bit-identical' if same else 'NOT bit-identical -- investigate'})")
+            if saved_install is not None:
+                shutil.move(str(saved_install), str(site / "libkintera_release.so"))
+                print("  restored the installed binding")
     return 0
 
 

@@ -166,7 +166,7 @@ are in the last column:[^ch12-dispatch-move]
 
 | stub | public entry | in the iterator | read outside the iterator | measured mismatch |
 |---|---|---|---|---|
-| `call_evolve_implicit` | `evolve_implicit` | `rate`, `jacobian` | `stoich` (argument) | `stoich` on the host with CUDA rates: illegal memory access (Limits) |
+| `call_evolve_implicit` | `evolve_implicit` | `rate`, `jacobian` | `stoich` (argument) | `stoich` on the host with CUDA rates: an illegal memory access on the build this table was measured on; on an RTX 5090 with CUDA 12.9 the same call **returns finite but silently wrong values** instead (Limits) |
 | `call_equilibrate_tp` | `ThermoX.forward` | `temp`, `pres`, `xfrac`, warm-start buffers | buffer `stoich` | module on the host, inputs on CUDA: illegal memory access; `float32` inputs with a `float64` module: `expected scalar type Float but found Double` |
 | `call_equilibrate_uv` | `ThermoY.forward` | `rho`, `intEng`, concentrations, warm-start buffers | buffer `stoich`, energy offsets and heat capacities | module on the host, inputs on CUDA: torch's device error, raised before the stub |
 | `call_logsvp_inline` | saturation curves, inside the two above | temperature, result | curve tables | none: the tables are copied to the inputs' device first |
@@ -412,6 +412,17 @@ $(10^{-6}, 10^{-4})$ for single, not a machine-independent bound.]
 - The saturation-adjustment drivers also read `stoich` through a raw pointer (`call_equilibrate_tp_cuda`,
   {{< code src/thermo/thermo_dispatch.cu call_equilibrate_tp_cuda >}}). A `ThermoX` left on the host with CUDA inputs
   ends the process with the same illegal memory access (@tbl-ch12-dispatch-contract).
+- **A host `stoich` is not reliably an error.** `evolve_implicit` reads `stoich` through a raw
+  pointer outside the tensor iterator, so passing it on the host while the rates and the Jacobian are
+  on CUDA is undefined. The outcome is not portable. Re-run at the same source pin on an RTX 5090
+  (CUDA 12.9, torch 2.10.0+cu128) with the pressure-switch deck and 64 cells, the call did **not**
+  fault: it returned finite values that differ from the all-CUDA result by $2.76\times10^{-1}$, while
+  a CPU-only run matches the all-CUDA result exactly. Reading host memory from a device kernel may
+  fault, may read stale memory, or may appear to work; on hardware with unified addressing it
+  silently corrupts instead of stopping. The table's "illegal memory access" is one observed
+  outcome, not a guarantee, and the quiet-corruption case is the more dangerous one.
+  [^ch12-dispatch-stoich]
+
 - **The absent-gas exit path has been surveyed on the CPU only.** `call_equilibrate_tp_cuda` runs the same per-cell
   `equilibrate_tp` as the CPU driver, including the exit pass whose activity test and weights differ from those of
   the iteration when a reaction's gas is exactly zero (@sec-ch04-equilibrate-tp, Limits). A structural survey of the in-tree
@@ -480,10 +491,14 @@ class recorded in the preparation's `identity.json`.]
 `tests/earth.yaml` and `examples/jupiter_kcl_mgsio3.yaml` over 110 to 1600 K and $10^2$ to $10^7$ Pa, five vapour
 amounts and every one- and two-vapour-zeroed variant, 12750 cells; run: `ThermoX.forward` with `max-iter` 400 and
 `ftol` $10^{-13}$, CPU, double; 14790 absent-gas **reaction instances**, 14688 at a converged exit, none with a
-live condensate or a non-zero gain row. The survey is structural: it records absent gases, condensate presence and
+live condensate or a non-zero gain row. Of the 14790, **102 did not reach a converged exit**, all in
+`examples/jupiter_kcl_mgsio3.yaml`. The survey is structural: it records absent gases, condensate presence and
 zero gain rows and columns, and does **not** compare the returned gain with a finite-difference
 $\mathrm d\xi_r/\mathrm dT$ on every instance; derivative agreement was checked on selected controls only, by a
-separate driver; `tests/jup-thermo.yaml` could not be loaded
+separate driver. The producer is `src/kintera_report/ch12/runs/absent_gas/` (grid: 17 temperatures, 6 pressures, 5 vapour amounts);
+`tests/jup-thermo.yaml` was skipped with `AttributeError: 'NoneType' object has no attribute 'max_iter'`.
+**Provenance gap:** the only retained raw output is from a *fix* working tree, not the `pin` leg this footnote
+cites, and the bundle carries no producing commit; running the pin leg would be new evidence, not a restoration; `tests/jup-thermo.yaml` could not be loaded
 through `ThermoX`; CPU and double precision only, no CUDA leg; a measurement outside the suite, not a committed
 check, driven by `src/kintera_report/ch12/runs/absent_gas_sweep.py`.]
 
