@@ -32,9 +32,21 @@ Two limits the chapter does not state:
 - `jup-thermo` was skipped with `AttributeError: 'NoneType' object has no attribute 'max_iter'`,
   not merely "could not be loaded".
 
-## The provenance gap
+## The pin leg has now been run (new validation)
+
+    K15_LEG=pin K15_WT=<checkout at 0d9f67f97d841147e23283d2dcdab302238d2c45> \
+        PYTHONPATH=<this directory> python run_sweep.py        # exit 0
+
+with `pin/_pyinstall/kintera` pointing at a kintera built from that exact sha. It returns the same
+totals as the retained fix leg -- **12750 / 14790 / 14688 / 0 / 0**, `jup-thermo` skipped with the
+same `AttributeError` -- so the chapter's numbers hold at the sha it cites. This is **new
+validation**: it does not restore the historical pin output, which is not retained.
+
+Note `run_sweep.py` imports its siblings, so `python -P` will not work; set `PYTHONPATH`.
+
+## The provenance gap that remains
 
 The retained output is labelled `LEG fix`, i.e. a **fix** working tree, not the `pin` leg at
 `code_pin.yml`. The chapter attributes these numbers to the pin. Running the `pin` leg here would
-be **new evidence**, not a restoration of the historical pin output, which is not retained. Until
-someone does that, the numbers should be read as coming from a build that is not the cited one.
+be **new evidence**, not a restoration of the historical pin output, which is not retained. The numbers are now confirmed at the cited sha, but the *historical* raw output behind the
+footnote remains the fix leg's, and no commit produces this bundle.

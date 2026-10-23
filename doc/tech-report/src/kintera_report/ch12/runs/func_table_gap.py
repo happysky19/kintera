@@ -114,6 +114,104 @@ def build(build_dir: pathlib.Path) -> None:
 
 
 def installed_lib_dir() -> pathlib.Path | None:
+    """Where the importable kintera keeps its shared libraries, asked in a THROWAWAY subprocess.
+
+    Importing kintera here would mmap the very library this script swaps, and then the swap
+    corrupts the loader's pages under a live mapping. That is what produced the exit-139
+    segmentation fault at teardown: not a CUDA context outliving anything -- no CUDA call is
+    needed to trigger it, and the probe already runs in its own process. A subprocess answers the
+    question and takes its mapping with it when it exits.
+    """
+    r = subprocess.run([sys.executable, "-c",
+                        "import kintera,pathlib;print(pathlib.Path(kintera.__file__).resolve().parent/'lib')"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    d = pathlib.Path(r.stdout.strip())
+    return d if d.is_dir() else None
+
+
+def swap_library(new_lib: pathlib.Path, dest: pathlib.Path) -> None:
+    """Install `new_lib` at `dest` atomically.
+
+    Never copy onto `dest` directly. A process that has it mapped keeps reading the same inode, so
+    an in-place rewrite changes code under its feet; a rename gives it a new inode and leaves the
+    old one intact until the last mapping goes away.
+    """
+    tmp = dest.with_name(dest.name + ".func_table_gap.swap")
+    shutil.copy2(new_lib, tmp)
+    os.replace(tmp, dest)
+
+
+def patched_source(text: str, where: str) -> str:
+    """add the test function to the CPU table and the name list, and to nothing else"""
+    if TEST_FN in text:
+        sys.exit("func_table_gap.py: the source already carries the scratch function; restore it first")
+    out = text.replace("namespace kintera {", "namespace kintera {\n" + DECL, 1)
+    if where == "end":
+        out = out.replace("na_h2s_visscher, na_h2s_visscher_ddT};",
+                          f"na_h2s_visscher, na_h2s_visscher_ddT,\n    {TEST_FN}, {TEST_FN}_ddT}};", 1)
+        out = out.replace('"na_h2s_visscher",\n    "na_h2s_visscher_ddT"};',
+                          f'"na_h2s_visscher",\n    "na_h2s_visscher_ddT", "{TEST_FN}", "{TEST_FN}_ddT"}};', 1)
+    else:
+        out = out.replace("user_func1 func1_table_cpu[] = {\n    h2o_ideal,",
+                          f"user_func1 func1_table_cpu[] = {{\n    {TEST_FN}, {TEST_FN}_ddT,\n    h2o_ideal,", 1)
+        out = out.replace('std::vector<std::string> func1_names = {\n    "h2o_ideal",',
+                          'std::vector<std::string> func1_names = {\n'
+                          f'    "{TEST_FN}", "{TEST_FN}_ddT",\n    "h2o_ideal",', 1)
+    if TEST_FN not in out.split("func1_table_cpu")[1].split("}")[0]:
+        sys.exit("func_table_gap.py: could not place the scratch function; the source has moved on "
+                 "from what this script knows. Update it rather than guessing.")
+    return out
+
+
+def sha(path: pathlib.Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+
+
+def cache_value(build_dir: pathlib.Path, key: str) -> str | None:
+    cache = build_dir / "CMakeCache.txt"
+    if not cache.exists():
+        return None
+    for line in cache.read_text(errors="replace").splitlines():
+        if line.startswith(key + ":"):
+            return line.split("=", 1)[1].strip()
+    return None
+
+
+def fresh_configure(build_dir: pathlib.Path, source: pathlib.Path, reuse: bool) -> None:
+    """Configure this build directory from scratch, for this source tree.
+
+    A disposable checkout is normally made with `cp -a`, which brings the build directory along.
+    Everything in it -- the cache, the generated makefiles, and a CMakeCache inside every
+    FetchContent `_deps/*-subbuild` -- still names the ORIGINAL tree. `cmake --build` then prints
+    "Build files have been written to: <original>/build-cuda", rebuilds nothing here, and exits 0,
+    so the whole cycle reports success while the library is never rebuilt. Repairing that
+    piecemeal is not worth it: the only state that is certainly ours is state we generated, so by
+    default the directory is removed and configured again. `--reuse-build` skips this for a build
+    directory you know was made here.
+    """
+    if reuse:
+        print("  --reuse-build: configuring skipped; the build directory must already be this tree's")
+        return
+    if build_dir.exists():
+        shutil.rmtree(build_dir)
+    args = ["cmake", "-S", str(source.resolve()), "-B", str(build_dir.resolve()),
+            "-DCMAKE_BUILD_TYPE=Release", "-DCUDA=ON", "-DNETCDF=ON"]
+    for env, flag in (("CMAKE_CUDA_ARCHITECTURES", "-DCMAKE_CUDA_ARCHITECTURES="),
+                      ("FUNC_TABLE_GAP_PYTHON", "-DPython3_EXECUTABLE=")):
+        if os.environ.get(env):
+            args.append(flag + os.environ[env])
+    print(f"  configuring {build_dir} from {source}")
+    subprocess.run(args, check=True, stdout=subprocess.DEVNULL)
+
+
+def build(build_dir: pathlib.Path) -> None:
+    subprocess.run(["cmake", "--build", str(build_dir), "--target", "kintera_release"],
+                   check=True, stdout=subprocess.DEVNULL)
+
+
+def installed_lib_dir() -> pathlib.Path | None:
     """where the importable kintera keeps its shared libraries, if there is one"""
     try:
         import kintera
@@ -147,6 +245,7 @@ def main() -> int:
     lib = build_dir / "lib" / "libkintera_release.so"
     saved_install = None
     baseline = None
+    probe_failed = 0
 
     shutil.copy2(src, backup)
     try:
@@ -176,12 +275,17 @@ def main() -> int:
         if site is not None:
             # Without this the probe imports the INSTALLED kintera and reads the old library, so the
             # mutation is invisible and the experiment silently reports agreement.
-            shutil.copy2(lib, site / "libkintera_release.so")
+            swap_library(lib, site / "libkintera_release.so")
             print(f"  refreshed the installed binding at {site}")
         else:
             print("  WARNING: no importable kintera found; the probe will not see the mutation")
         rc = subprocess.run([sys.executable, "-P", str(probe), *args.names.split()]).returncode
         print(f"probe exit {rc}")
+        if rc != 0:
+            # The probe is the measurement. Printing its status and carrying on would turn a
+            # failed experiment into a silent pass, which is the class of bug this script already
+            # had once. Restoration still runs: it is in the finally below.
+            probe_failed = rc
     finally:
         shutil.move(str(backup), str(src))
         # The backup keeps the original mtime, so the restored file looks OLDER than the object
@@ -197,9 +301,10 @@ def main() -> int:
                   f"{baseline} -> {restored} "
                   f"({'bit-identical' if same else 'NOT bit-identical -- investigate'})")
             if saved_install is not None:
-                shutil.move(str(saved_install), str(site / "libkintera_release.so"))
+                swap_library(saved_install, site / "libkintera_release.so")
+                saved_install.unlink(missing_ok=True)
                 print("  restored the installed binding")
-    return 0
+    return probe_failed
 
 
 if __name__ == "__main__":

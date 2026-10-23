@@ -497,8 +497,10 @@ zero gain rows and columns, and does **not** compare the returned gain with a fi
 $\mathrm d\xi_r/\mathrm dT$ on every instance; derivative agreement was checked on selected controls only, by a
 separate driver. The producer is `src/kintera_report/ch12/runs/absent_gas/` (grid: 17 temperatures, 6 pressures, 5 vapour amounts);
 `tests/jup-thermo.yaml` was skipped with `AttributeError: 'NoneType' object has no attribute 'max_iter'`.
-**Provenance gap:** the only retained raw output is from a *fix* working tree, not the `pin` leg this footnote
-cites, and the bundle carries no producing commit; running the pin leg would be new evidence, not a restoration; `tests/jup-thermo.yaml` could not be loaded
+The `pin` leg has since been **run at this footnote's own source sha** and returns the same totals: 12750 cells,
+14790 absent-gas reaction instances, 14688 at a converged exit, no cloud or gain violations, `jup-thermo`
+skipped. That is **new validation, not a restoration** of the historical raw output, which is not retained:
+the only saved output is from a *fix* working tree and its bundle carries no producing commit; `tests/jup-thermo.yaml` could not be loaded
 through `ThermoX`; CPU and double precision only, no CUDA leg; a measurement outside the suite, not a committed
 check, driven by `src/kintera_report/ch12/runs/absent_gas_sweep.py`.]
 

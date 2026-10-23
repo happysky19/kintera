@@ -144,3 +144,39 @@ def test_func_table_gap_stamps_mtime_so_the_restore_really_rebuilds():
     object built from the patched one and cmake skips it."""
     src = (RUNS / "func_table_gap.py").read_text()
     assert src.count("os.utime(src, None)") >= 2
+
+
+def test_the_parent_never_imports_the_library_it_swaps():
+    """Importing kintera in the parent mmaps the very file the cycle overwrites. Measured: an
+    in-place overwrite after `import kintera` segfaults at teardown (exit 139); the same swap done
+    atomically exits 0. The lookup therefore happens in a throwaway subprocess."""
+    src = (RUNS / "func_table_gap.py").read_text()
+    i = src.index("def installed_lib_dir")
+    body = src[i:src.index("\ndef ", i + 1)]
+    assert "subprocess.run" in body
+    assert "import kintera" not in body.replace('"import kintera,pathlib;', "")
+
+
+def test_library_swaps_are_atomic_not_in_place():
+    """os.replace gives the running process a new inode; shutil.copy2 onto a mapped file does not."""
+    src = (RUNS / "func_table_gap.py").read_text()
+    i = src.index("def swap_library")
+    body = src[i:src.index("\ndef ", i + 1)]
+    assert "os.replace(tmp, dest)" in body
+    # and the in-place overwrite is gone from the swap sites
+    assert "shutil.copy2(lib, site" not in src
+
+
+def test_a_failing_probe_is_propagated_not_printed_and_dropped():
+    src = (RUNS / "func_table_gap.py").read_text()
+    assert "probe_failed = rc" in src
+    assert "return probe_failed" in src
+
+
+def test_restoration_is_unconditional():
+    """Restoration lives in finally, so a failing probe still puts the tree and binding back."""
+    src = (RUNS / "func_table_gap.py").read_text()
+    fin = src[src.index("    finally:"):]
+    assert "shutil.move(str(backup), str(src))" in fin
+    assert "os.utime(src, None)" in fin
+    assert "swap_library(saved_install" in fin
