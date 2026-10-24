@@ -1,4 +1,4 @@
-"""K42 matched float64 CPU/CUDA probe, implementation pin 0d9f67f97d841147e23283d2dcdab302238d2c45.
+"""K42 matched float64 CPU/CUDA probe, run at the pin the report sets in `code_pin.yml`.
 The supplied 2000-trial RNG sequence is unchanged. Floating-point U@V is
 numerically rank deficient; this does not prove exact rank of stored entries.
 No assertion of identical classifications or a universal singularity detector.
@@ -8,7 +8,14 @@ import numpy as np
 import scipy,scipy.sparse as sp,scipy.sparse.linalg as spl
 import torch,kintera as kt
 from kintera.kintera import cuda_csr_solve_cusolver
-PIN='0d9f67f97d841147e23283d2dcdab302238d2c45'
+# The expected pin is the report's own doc/tech-report/code_pin.yml, two directories up: the single
+# source of truth, so this driver runs at whatever pin the report sets rather than at a literal.
+PIN_FILE=pathlib.Path(__file__).resolve().parents[2]/'code_pin.yml'
+def read_pin(path=PIN_FILE):
+    for line in path.read_text().splitlines():
+        if line.startswith('sha:'): return line.split(':',1)[1].strip()
+    raise SystemExit(f'check_ch12_k42.py: no "sha:" line in {path}')
+PIN=read_pin()
 torch.set_num_threads(1)
 def emit(x): print(json.dumps(x,allow_nan=False),flush=True)
 def native(A,b):

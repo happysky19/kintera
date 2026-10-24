@@ -45,11 +45,14 @@ print(f"(a) func1: {len(names)} names, {len(host)} host, {len(dev)} device slots
       f"host==names {host == names}, device==[nullptr]+names {dev == ['nullptr'] + names}  "
       f"{ok(host == names and dev == ['nullptr'] + names)}")
 
-# (b) func2/func3: empty on host, placeholder only on device
+# (b) func2/func3: device table == [nullptr] + host table, the same relation (a) checks for func1.
+# Both tables were empty up to pin 0d9f67f9, where [nullptr] + [] is exactly the placeholder-only
+# device table that used to be asserted; since e357792d func2 carries the H2 rotational entries, so
+# emptiness is no longer the criterion while the index relation still is.
 h2, h3 = brace_list(cpp, "func2_table_cpu"), brace_list(cpp, "func3_table_cpu")
 d2, d3 = brace_list(cu, "func2_table_cuda"), brace_list(cu, "func3_table_cuda")
 print(f"(b) func2/func3: host {h2}/{h3}, device {d2}/{d3}  "
-      f"{ok(h2 == [] and h3 == [] and d2 == ['nullptr'] and d3 == ['nullptr'])}")
+      f"{ok(d2 == ['nullptr'] + h2 and d3 == ['nullptr'] + h3)}")
 
 # (c) every stub defined in a .cpp has a CPU registration and a CUDA registration
 pairs = ["src/kinetics/evolve_implicit_dispatch", "src/thermo/thermo_dispatch",

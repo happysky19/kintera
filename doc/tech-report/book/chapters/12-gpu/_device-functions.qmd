@@ -79,8 +79,11 @@ written as `DISPATCH_MACRO` functions in `src/vapors/vapor_functions.h` so that 
 appended to `func1_table_cpu` ({{< code src/func_table.cpp func1_table_cpu >}}) and their names to `func1_names`
 ({{< code src/func_table.cpp func1_names >}}), and the same two functions to `func1_table_cuda`
 ({{< code src/func_table.cu func1_table_cuda >}}), after the `nullptr` placeholder and at the same positions. The
-tables for functions of two and three arguments, `func2_table_cuda` and `func3_table_cuda`, hold only the
-placeholder at the pin. @fig-ch12-device-functions-tables shows the three lists.
+tables for functions of two and three arguments, `func2_table_cuda` and `func3_table_cuda`, follow the same
+convention: the placeholder first, then the entries of `func2_table_cpu` and `func3_table_cpu` in the same order.
+Both host tables are empty at the pin, so both device tables hold the placeholder alone; from
+`e357792d50639d68e9090b542edf038d2b029aa2` on, `func2` carries the H2 rotational entries and its device table
+carries the same names behind the placeholder. @fig-ch12-device-functions-tables shows the three lists.
 
 ```{python}
 #| label: fig-ch12-device-functions-tables
@@ -118,8 +121,10 @@ No test evaluates the `_ddT` entries on CUDA.
 The length-and-order property that no test covers is checked instead by `check_ch12_twins.py`, statically and with
 no GPU: line a reads "func1: 22 names, 22 host, 23 device slots; host==names True, device==[nullptr]+names True
 PASS", which is @eq-ch12-device-functions-index asserted over the whole table rather than over the 11 named curves,
-and line b, "func2/func3: host []/[], device ['nullptr']/['nullptr'] PASS", records that the two- and
-three-argument tables hold only the placeholder at the pin.[^ch12-kernels-check] A check that reads the source
+and line b applies the same relation to the two- and three-argument tables, requiring each device table to be the
+placeholder followed by its host table in order: it reads "func2/func3: host []/[], device
+['nullptr']/['nullptr'] PASS" at the pin, where both host tables are empty, and keeps holding when a host table
+is filled.[^ch12-kernels-check] A check that reads the source
 cannot replace the runtime test: it would not catch a device table whose *entries* point at the wrong functions,
 only one whose names or length disagree.
 
